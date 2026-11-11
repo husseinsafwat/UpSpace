@@ -1,0 +1,29 @@
+name: Build Windows installer
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
+      - name: Run tests
+        run: python -m unittest discover tests
+      - name: Build UpSpace.exe
+        run: python -m PyInstaller --noconfirm --windowed --name UpSpace --icon assets/upspace.ico --collect-data customtkinter --add-data "assets;assets" main.py
+      - name: Build installer
+        run: makensis installer/upspace.nsi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: UpSpace-Setup
+          path: dist/UpSpace-Setup.exe
