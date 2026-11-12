@@ -24,9 +24,11 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt pyinstaller
       - name: Run tests
+        env:
+          QT_QPA_PLATFORM: offscreen
         run: python -m unittest discover tests
       - name: Build UpSpace.exe
-        run: python -m PyInstaller --noconfirm --windowed --name UpSpace --icon assets/upspace.ico --collect-data customtkinter --add-data "assets;assets" main.py
+        run: python -m PyInstaller --noconfirm --windowed --name UpSpace --icon assets/upspace.ico --add-data "assets;assets" main.py
       - name: Install NSIS (if the runner doesn't have it)
         shell: pwsh
         run: |
@@ -41,7 +43,7 @@ jobs:
           if (-not $makensis) { $makensis = "${env:ProgramFiles(x86)}\NSIS\makensis.exe" }
           $nsisArgs = @()
           if ("${{ github.ref_type }}" -eq "tag") { $nsisArgs += "/DAPPVER=$("${{ github.ref_name }}".TrimStart('v'))" }
-          & $makensis @args installer/upspace.nsi
+          & $makensis @nsisArgs installer/upspace.nsi
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - uses: actions/upload-artifact@v4
         with:

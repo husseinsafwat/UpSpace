@@ -1,7 +1,7 @@
 # UpSpace · Bookings & Billing
 
 A small Windows desktop app for the UpSpace accountant: room bookings, hall chairs, live timers,
-a drinks & food menu, checkout bills, expenses and the daily money total. Python + CustomTkinter + SQLite.
+a drinks & food menu, checkout bills, expenses and the daily money total. Python + Qt (PySide6) + SQLite.
 
 ## Run it
 1. Install Python 3.10 or newer from python.org (tick **"Add python.exe to PATH"** during setup).
