@@ -1,7 +1,7 @@
 # UpSpace · Bookings & Billing
 
 A small Windows desktop app for the UpSpace accountant: room bookings, hall chairs, live timers,
-drinks/add-ons, checkout bills, expenses and the daily money total. Python + CustomTkinter + SQLite.
+a drinks & food menu, checkout bills, expenses and the daily money total. Python + CustomTkinter + SQLite.
 
 ## Run it
 1. Install Python 3.10 or newer from python.org (tick **"Add python.exe to PATH"** during setup).
@@ -21,15 +21,28 @@ Back this file up (copy it somewhere safe) now and then.
 |---|---|
 | Room time | exact minutes ÷ 60 × hourly price (after discount). No rounding, no minimum. |
 | Room discount | per card: EGP off each hour, or % off the hourly price. Never applies to drinks. |
-| Hall time | minimum 1 hour; after that, under 30 min extra is dropped, 30 min or more = full hour. Per chair: 15 + 15 + 10 + 10 for hours 1–4 (max 50). × number of chairs. No discount. |
-| Hall chairs | 16 in total. A booking can't take more than the free chairs. A group starts together on one card; chairs can't be added later, only drinks. |
+| Hall time | minimum 1 hour; after that, under 30 min extra is dropped, 30 min or more = full hour. Per chair: 15 + 15 + 10 + 10 for hours 1–4 (max 50, set in **Settings**). × number of chairs. No discount. |
+| Hall chairs | 16 in total (set in **Settings**). A booking can't take more than the free chairs. A group starts together on one card; chairs can't be added later, only drinks. |
+| Drinks, food & add-ons | only from the **Menu** tab. On a card, **+ Items** opens the menu: press + / − per item (and size), then **Review & confirm**. Add-ons are their own lines. |
 | Total | time cost + drinks/add-ons. |
 | Money page | for the chosen day (today by default): money in from closed bills, minus expenses = total now. Open cards are shown separately and counted at checkout. |
 
-Room prices are copied onto a card when it starts, so changing a room's price only affects new bookings.
+Room prices and hall prices are copied onto a card when it starts, so changing them only affects new bookings.
+Menu prices are copied onto the card when items are added, so editing or removing a menu item never changes a bill.
+
+## Menu
+Each item has a name, a category and either one price or sizes (Small / Medium / Large, at least two).
+The first start fills the menu with the UpSpace drinks list; after that it's fully editable in the Menu tab.
+
+## Money report (Excel)
+On the Money page, **Download report** saves an .xlsx file for a date range (default: the first day with data
+up to today) or for one month. Each day with activity gets its own sheet (summary, items consumed, expenses);
+the last sheet, **Total**, has one row per day and the totals for the whole period. Dates before the first day
+with data or after today are refused.
 
 ## Settings
-`config.py` holds the chair count, hall prices and the login. The password is stored as a SHA-256 hash; to
+The **Settings** tab holds the hall (number of chairs, price per chair for hours 1–4) and the rooms
+(name + price per hour). `config.py` holds the starting hall values and the login. The password is stored as a SHA-256 hash; to
 change it, put the output of
 `python -c "import hashlib;print(hashlib.sha256(b'NEW-PASSWORD').hexdigest())"` in `LOGIN_PASSWORD_SHA256`.
 

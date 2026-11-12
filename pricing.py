@@ -4,7 +4,9 @@ ROOM  : exact minutes / 60 x discounted hourly price. No rounding, no minimum.
         Discount is per card: EGP off each hour, or % off the hourly price.
 HALL  : billed hours = at least 1; after that a leftover under 30 min is dropped,
         30 min or more counts as a full hour.
-        Per chair: 15, 15, 10, 10 for hours 1-4 (max 50), x number of chairs.
+        Per chair: tier prices for hours 1-4 (default 15, 15, 10, 10, so max 50),
+        x number of chairs. The tiers are edited in Settings and copied onto each
+        hall card when it starts.
         No discount for the hall.
 ITEMS : drinks / add-ons are added at full price, never discounted.
 """
@@ -47,12 +49,25 @@ def hall_billed_hours(minutes: int) -> int:
     return hours + (1 if rest >= 30 else 0)
 
 
-def hall_price_per_chair(billed_hours: int) -> float:
-    return float(sum(HALL_HOUR_TIERS[:max(0, billed_hours)]))
+def hall_price_per_chair(billed_hours: int, tiers=None) -> float:
+    """Sum of the tier prices for the billed hours. Hours past the last tier are free,
+    so a chair never costs more than sum(tiers)."""
+    tiers = HALL_HOUR_TIERS if tiers is None else tiers
+    return float(sum(tiers[:max(0, billed_hours)]))
 
 
-def hall_time_cost(minutes: int, chairs: int) -> float:
-    return round(hall_price_per_chair(hall_billed_hours(minutes)) * int(chairs), 2)
+def hall_time_cost(minutes: int, chairs: int, tiers=None) -> float:
+    return round(hall_price_per_chair(hall_billed_hours(minutes), tiers) * int(chairs), 2)
+
+
+def tiers_to_text(tiers) -> str:
+    return ",".join(fmt_money(t).replace(",", "") for t in tiers)
+
+
+def tiers_from_text(text: str | None):
+    if not text:
+        return None
+    return [float(x) for x in text.split(",") if x.strip()]
 
 
 def validate_discount(discount_type: str, discount_value: float, price_per_hour: float) -> str | None:

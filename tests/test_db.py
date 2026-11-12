@@ -23,12 +23,12 @@ class DatabaseFlow(unittest.TestCase):
     def test_room_checkout_with_discount_and_items(self):
         start = datetime.now() - timedelta(minutes=95)
         cid = self.db.open_room_card("Ali", "010", self.room, when=start)
-        self.db.add_item(cid, "Latte", 40)
-        self.db.add_item(cid, "Water", 10)
+        menu = {r["name"]: r["id"] for r in self.db.list_menu()}
+        self.db.add_items(cid, [(menu["Tea"], None, 1), (menu["Herbs"], None, 1), (menu["Flavor"], None, 1)])
         self.db.set_discount(cid, DISCOUNT_EGP, 20)          # 100/hr
         bill = self.db.close_card(cid, end=start + timedelta(minutes=95))
         self.assertEqual(bill.time_cost, round(95 / 60 * 100, 2))
-        self.assertEqual(bill.items_total, 50)
+        self.assertEqual(bill.items_total, 50)                # 15 + 20 + 15
         self.assertEqual(bill.total, round(95 / 60 * 100 + 50, 2))
         self.assertEqual(len(self.db.free_rooms()), 1)       # room freed
 
@@ -53,7 +53,8 @@ class DatabaseFlow(unittest.TestCase):
     def test_summary(self):
         start = datetime.now().replace(hour=10, minute=0, second=0, microsecond=0)
         r = self.db.open_room_card("Ali", "", self.room, when=start)
-        self.db.add_item(r, "Latte", 40)
+        coffee = next(m["id"] for m in self.db.list_menu() if m["name"] == "French Coffee")
+        self.db.add_items(r, [(coffee, None, 1)])                      # 40
         self.db.close_card(r, end=start + timedelta(minutes=90))       # 180 + 40
         h = self.db.open_hall_card("G", "", 3, when=start)
         self.db.close_card(h, end=start + timedelta(minutes=160))      # 3 x 40 = 120

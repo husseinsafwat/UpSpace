@@ -8,15 +8,17 @@ import hashlib
 import os
 import sys
 import tkinter as tk
+import calendar
 import tkinter.font as tkfont
+from tkinter import filedialog
 from datetime import date, datetime, timedelta
 
 import customtkinter as ctk
 
 import pricing
-from config import (CHARCOAL, CURRENCY, DANGER, DB_FILENAME, HALL_TOTAL_CHAIRS, IVORY, LOGIN_EMAIL,
-                    LOGIN_PASSWORD_SHA256, SOFT, STONE, WHITE)
-from db import BookingError, Database
+from config import (CHARCOAL, CURRENCY, DANGER, DB_FILENAME, IVORY, LOGIN_EMAIL, LOGIN_PASSWORD_SHA256, SOFT,
+                    STONE, WHITE)
+from db import SIZES, BookingError, Database, item_label
 from pricing import fmt_duration, fmt_money
 
 try:
@@ -165,30 +167,210 @@ class Dialog(ctk.CTkToplevel):
         return ok
 
 
-class ItemDialog(Dialog):
-    """Add a drink / add-on: name + price."""
+def price_text(prices: dict) -> str:
+    """'15' or 'S 30 · M 40'."""
+    if None in prices:
+        return fmt_money(prices[None])
+    return "  ·  ".join(f"{size} {fmt_money(p)}" for size, p in prices.items())
 
-    def __init__(self, master, db: Database, card_id: int, on_done):
-        super().__init__(master, "Add item", 400, 290)
-        self.db, self.card_id, self.on_done = db, card_id, on_done
-        ctk.CTkLabel(self.body, text="Add item to card", font=FONT["h3"], text_color=CHARCOAL).pack(anchor="w")
-        field_label(self.body, "Item name").pack(anchor="w", pady=(12, 2))
-        self.name = entry(self.body, "e.g. Latte")
-        self.name.pack(fill="x")
-        field_label(self.body, f"Price ({CURRENCY})").pack(anchor="w", pady=(10, 2))
-        self.price = entry(self.body, "e.g. 40")
-        self.price.pack(fill="x")
-        self.buttons("Add item", self.save)
-        self.after(150, self.name.focus_set)
 
-    def save(self):
-        try:
-            self.db.add_item(self.card_id, self.name.get(), parse_number(self.price.get()))
-        except (BookingError, ValueError) as e:
-            self.show_error(str(e) if isinstance(e, BookingError) else "Price must be a number.")
+class MenuPickerDialog(Dialog):
+    """Add drinks / food / add-ons to a card from the menu.
+
+    + puts one in the cart, − takes one out. "Review" shows the cart in a small window,
+    and Confirm there adds everything to the card.
+    """
+
+    def __init__(self, master, db: Database, card, on_done):
+        super().__init__(master, "Add from menu", 980, 660)
+        self.db, self.card, self.on_done = db, card, on_done
+        self.cart: dict[tuple[int, str | None], int] = {}
+        self.menu = {r["id"]: r for r in db.list_menu()}
+        self.counts: dict[tuple[int, str | None], ctk.CTkLabel] = {}
+
+        top = ctk.CTkFrame(self.body, fg_color="transparent")
+        top.pack(fill="x")
+        ctk.CTkLabel(top, text="Add from menu", font=FONT["h2"], text_color=CHARCOAL).pack(side="left")
+        place = card["room_name"] if card["kind"] == "room" else f"Hall · {card['chairs']} chair(s)"
+        ctk.CTkLabel(top, text=f"   {card['customer_name']}  ·  {place}", font=FONT["body"],
+                     text_color=STONE).pack(side="left")
+        self.search = entry(top, "Search…", width=220)
+        self.search.pack(side="right")
+        self.search.bind("<KeyRelease>", lambda e: self.build_list())
+
+        cats = ["All"] + db.menu_categories()
+        self.cat = ctk.CTkSegmentedButton(self.body, values=cats, command=lambda v: self.on_cat(),
+                                          font=FONT["small"], height=32, fg_color=SOFT, selected_color=CHARCOAL,
+                                          selected_hover_color=HOVER, unselected_color=SOFT,
+                                          unselected_hover_color="#d8d3c7", text_color=CHARCOAL)
+        self.cat.set("All")
+        self.cat.pack(fill="x", pady=(10, 8))
+        style_segmented(self.cat)
+
+        main = ctk.CTkFrame(self.body, fg_color="transparent")
+        main.pack(fill="both", expand=True)
+        main.grid_columnconfigure(0, weight=1)
+        main.grid_rowconfigure(0, weight=1)
+        self.list = ctk.CTkScrollableFrame(main, fg_color=WHITE, corner_radius=12, border_width=1,
+                                           border_color=SOFT)
+        self.list.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
+        self.list.grid_columnconfigure(0, weight=1)
+
+        side = panel(main, width=300)
+        side.grid(row=0, column=1, sticky="ns")
+        side.grid_propagate(False)
+        side.grid_rowconfigure(1, weight=1)
+        side.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(side, text="Cart", font=FONT["h3"], text_color=CHARCOAL).grid(row=0, column=0, sticky="w",
+                                                                              padx=16, pady=(14, 4))
+        self.cart_box = ctk.CTkScrollableFrame(side, fg_color="transparent")
+        self.cart_box.grid(row=1, column=0, sticky="nsew", padx=6)
+        self.cart_box.grid_columnconfigure(0, weight=1)
+        self.cart_total = ctk.CTkLabel(side, text="", font=FONT["h2"], text_color=CHARCOAL)
+        self.cart_total.grid(row=2, column=0, sticky="w", padx=16, pady=(6, 4))
+        self.review_btn = primary_button(side, "Review & confirm", self.review)
+        self.review_btn.grid(row=3, column=0, sticky="ew", padx=12)
+        ghost_button(side, "Close", self.destroy, height=34).grid(row=4, column=0, sticky="ew", padx=12,
+                                                                  pady=(6, 12))
+        self.build_list()
+        self.update_cart()
+
+    def on_cat(self):
+        style_segmented(self.cat)
+        self.build_list()
+
+    def build_list(self):
+        for w in self.list.winfo_children():
+            w.destroy()
+        self.counts = {}
+        cat = self.cat.get()
+        q = self.search.get().strip().lower()
+        rows = [m for m in self.menu.values()
+                if (cat == "All" or m["category"] == cat) and (not q or q in m["name"].lower())]
+        if not rows:
+            ctk.CTkLabel(self.list, text="No items here. Add items in the Menu tab.", font=FONT["body"],
+                         text_color=STONE).grid(row=0, column=0, sticky="w", padx=12, pady=12)
             return
+        r, last_cat = 0, None
+        for m in rows:
+            if m["category"] != last_cat:
+                last_cat = m["category"]
+                field_label(self.list, last_cat).grid(row=r, column=0, columnspan=2, sticky="w", padx=12,
+                                                      pady=(12 if r else 6, 2))
+                r += 1
+            ctk.CTkLabel(self.list, text=m["name"], font=FONT["bold"], text_color=CHARCOAL, anchor="w").grid(
+                row=r, column=0, sticky="w", padx=12, pady=4)
+            opts = ctk.CTkFrame(self.list, fg_color="transparent")
+            opts.grid(row=r, column=1, sticky="e", padx=8)
+            for size, price in Database.item_prices(m).items():
+                self._counter(opts, m["id"], size, price).pack(side="left", padx=(10, 0))
+            r += 1
+
+    def _counter(self, master, item_id, size, price):
+        box = ctk.CTkFrame(master, fg_color=IVORY, corner_radius=8)
+        label = (f"{size}  " if size else "") + fmt_money(price)
+        ctk.CTkLabel(box, text=label, font=FONT["small"], text_color=CHARCOAL, width=58).pack(side="left",
+                                                                                          padx=(8, 2))
+        ghost_button(box, "−", lambda: self.change(item_id, size, -1), width=28, height=28).pack(side="left")
+        n = ctk.CTkLabel(box, text="", font=FONT["bold"], text_color=CHARCOAL, width=26)
+        n.pack(side="left")
+        primary_button(box, "+", lambda: self.change(item_id, size, 1), width=28, height=28).pack(
+            side="left", padx=(0, 6), pady=4)
+        self.counts[(item_id, size)] = n
+        self._show_count(item_id, size)
+        return box
+
+    def _show_count(self, item_id, size):
+        label = self.counts.get((item_id, size))
+        if label is not None:
+            qty = self.cart.get((item_id, size), 0)
+            label.configure(text=str(qty) if qty else "·")
+
+    def change(self, item_id, size, delta):
+        key = (item_id, size)
+        qty = max(0, self.cart.get(key, 0) + delta)
+        if qty:
+            self.cart[key] = qty
+        else:
+            self.cart.pop(key, None)
+        self._show_count(item_id, size)
+        self.update_cart()
+
+    def lines(self):
+        """[(label, qty, line_total, (item_id, size))] in the order they were added."""
+        out = []
+        for (item_id, size), qty in self.cart.items():
+            m = self.menu[item_id]
+            unit = Database.item_prices(m)[size]
+            name = m["name"] + (f" ({size})" if size else "")
+            out.append((f"{qty} × {name}", qty, unit * qty, (item_id, size)))
+        return out
+
+    def update_cart(self):
+        for w in self.cart_box.winfo_children():
+            w.destroy()
+        lines = self.lines()
+        if not lines:
+            ctk.CTkLabel(self.cart_box, text="Empty. Press + next to an item.", font=FONT["small"],
+                         text_color=STONE).grid(row=0, column=0, sticky="w", padx=8)
+        for i, (label, _, total, key) in enumerate(lines):
+            ctk.CTkLabel(self.cart_box, text=label, font=FONT["small"], text_color=CHARCOAL, anchor="w",
+                         wraplength=170, justify="left").grid(row=i, column=0, sticky="w", padx=(8, 4), pady=1)
+            ctk.CTkLabel(self.cart_box, text=fmt_money(total), font=FONT["small"], text_color=CHARCOAL).grid(
+                row=i, column=1, sticky="e")
+            ctk.CTkButton(self.cart_box, text="×", width=22, height=22, fg_color="transparent", hover_color=SOFT,
+                          text_color=STONE, font=FONT["bold"],
+                          command=lambda k=key: self.change(k[0], k[1], -self.cart.get(k, 0))).grid(
+                row=i, column=2, padx=4)
+        count = sum(self.cart.values())
+        self.cart_total.configure(text=f"{money(sum(l[2] for l in lines))}" + (f"  ·  {count} item(s)" if count
+                                                                                  else ""))
+        self.review_btn.configure(state="normal" if lines else "disabled")
+
+    def review(self):
+        if self.cart:
+            CartReviewDialog(self, self.lines(), self.confirm)
+
+    def confirm(self) -> str | None:
+        """Called by the review window. Returns an error message, or None when added."""
+        try:
+            self.db.add_items(self.card["id"], [(i, s, q) for (i, s), q in self.cart.items()])
+        except BookingError as e:
+            return str(e)
         self.destroy()
         self.on_done()
+        return None
+
+
+class CartReviewDialog(Dialog):
+    """Small window: every line in the cart and the total. Confirm adds them to the card."""
+
+    def __init__(self, master, lines, on_confirm):
+        super().__init__(master, "Review items", 420, min(560, 250 + 26 * len(lines)))
+        self.on_confirm = on_confirm
+        ctk.CTkLabel(self.body, text="Add these to the card?", font=FONT["h3"], text_color=CHARCOAL).pack(anchor="w")
+        box = panel(self.body)
+        box.pack(fill="both", expand=True, pady=(10, 0))
+        box.grid_columnconfigure(0, weight=1)
+        for i, (label, _, total, _) in enumerate(lines):
+            ctk.CTkLabel(box, text=label, font=FONT["body"], text_color=CHARCOAL, anchor="w").grid(
+                row=i, column=0, sticky="w", padx=14, pady=(10 if i == 0 else 1, 1))
+            ctk.CTkLabel(box, text=money(total), font=FONT["body"], text_color=CHARCOAL).grid(row=i, column=1,
+                                                                                              sticky="e", padx=14)
+        bar = ctk.CTkFrame(box, fg_color=CHARCOAL, corner_radius=8)
+        bar.grid(row=len(lines), column=0, columnspan=2, sticky="ew", padx=10, pady=10)
+        ctk.CTkLabel(bar, text=f"TOTAL · {sum(l[1] for l in lines)} item(s)", font=FONT["bold"],
+                     text_color=IVORY).pack(side="left", padx=12, pady=8)
+        ctk.CTkLabel(bar, text=money(sum(l[2] for l in lines)), font=FONT["h2"], text_color=IVORY).pack(
+            side="right", padx=12)
+        self.buttons("Confirm", self.confirm, cancel_text="Back")
+
+    def confirm(self):
+        error = self.on_confirm()
+        if error:
+            self.show_error(error)
+        else:
+            self.destroy()
 
 
 class DiscountDialog(Dialog):
@@ -298,7 +480,7 @@ class CheckoutDialog(Dialog):
             rows += [("Billed hours", f"{int(bill.billed_hours)} h"),
                      ("Hall time", f"{fmt_money(bill.rate)} × {card['chairs']} chair(s) = {money(bill.time_cost)}")]
         for it in items:
-            rows.append((f"  {it['name']}", money(it["price"])))
+            rows.append((f"  {item_label(it)}", money(it["price"])))
         rows.append(("Drinks & add-ons", money(bill.items_total)))
         for i, (k, v) in enumerate(rows):
             ctk.CTkLabel(box, text=k, font=FONT["small"], text_color=STONE, anchor="w").grid(
@@ -392,6 +574,206 @@ class RoomDialog(Dialog):
         self.on_done()
 
 
+class MenuItemDialog(Dialog):
+    """New / edit menu item: name, category, and one price or a price per size."""
+
+    def __init__(self, master, db: Database, on_done, item=None, category=None):
+        super().__init__(master, "Menu item", 440, 470)
+        self.db, self.on_done, self.item = db, on_done, item
+        ctk.CTkLabel(self.body, text="Edit item" if item else "New menu item", font=FONT["h3"],
+                     text_color=CHARCOAL).pack(anchor="w")
+        field_label(self.body, "Name").pack(anchor="w", pady=(12, 2))
+        self.name = entry(self.body, "e.g. Latte")
+        self.name.pack(fill="x")
+        field_label(self.body, "Category (pick or type a new one)").pack(anchor="w", pady=(10, 2))
+        cats = db.menu_categories() or ["Hot Drinks"]
+        self.cat = ctk.CTkComboBox(self.body, values=cats, height=38, corner_radius=8, border_color=STONE,
+                                   fg_color=WHITE, text_color=CHARCOAL, button_color=SOFT,
+                                   button_hover_color="#d8d3c7", dropdown_fg_color=WHITE,
+                                   dropdown_text_color=CHARCOAL, dropdown_hover_color=SOFT, font=FONT["body"],
+                                   dropdown_font=FONT["body"])
+        self.cat.pack(fill="x")
+        self.cat.set(item["category"] if item else (category or cats[0]))
+
+        self.sized = ctk.BooleanVar(value=bool(item) and None not in Database.item_prices(item))
+        ctk.CTkSwitch(self.body, text="Sold in sizes (Small / Medium / Large)", variable=self.sized,
+                      command=self.toggle, font=FONT["body"], text_color=CHARCOAL, progress_color=CHARCOAL,
+                      button_color=STONE, button_hover_color=CHARCOAL).pack(anchor="w", pady=(14, 6))
+        self.single = ctk.CTkFrame(self.body, fg_color="transparent")
+        field_label(self.single, f"Price ({CURRENCY})").pack(anchor="w", pady=(0, 2))
+        self.price = entry(self.single, "e.g. 40")
+        self.price.pack(fill="x")
+        self.sizes_box = ctk.CTkFrame(self.body, fg_color="transparent")
+        self.size_entries = {}
+        for i, (code, label, _) in enumerate(SIZES):
+            self.sizes_box.grid_columnconfigure(i, weight=1, uniform="s")
+            field_label(self.sizes_box, f"{label} ({CURRENCY})").grid(row=0, column=i, sticky="w",
+                                                                    padx=(0 if i == 0 else 6, 0))
+            e = entry(self.sizes_box, "—")
+            e.grid(row=1, column=i, sticky="ew", padx=(0 if i == 0 else 6, 0))
+            self.size_entries[code] = e
+        ctk.CTkLabel(self.sizes_box, text="Fill the sizes this item comes in (at least two). Leave the others "
+                                          "empty.", font=FONT["small"], text_color=STONE, wraplength=380,
+                     justify="left").grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        if item:
+            self.name.insert(0, item["name"])
+            prices = Database.item_prices(item)
+            if None in prices:
+                self.price.insert(0, fmt_money(prices[None]).replace(",", ""))
+            else:
+                for code, p in prices.items():
+                    self.size_entries[code].insert(0, fmt_money(p).replace(",", ""))
+        self.toggle()
+        self.buttons("Save", self.save)
+        self.after(150, self.name.focus_set)
+
+    def toggle(self):
+        if self.sized.get():
+            self.single.pack_forget()
+            self.sizes_box.pack(fill="x")
+        else:
+            self.sizes_box.pack_forget()
+            self.single.pack(fill="x")
+
+    def save(self):
+        if self.sized.get():
+            price, sizes = None, {c: e.get() for c, e in self.size_entries.items()}
+        else:
+            price, sizes = self.price.get(), None
+        try:
+            if self.item:
+                self.db.update_menu_item(self.item["id"], self.name.get(), self.cat.get(), price, sizes)
+            else:
+                self.db.add_menu_item(self.name.get(), self.cat.get(), price, sizes)
+        except BookingError as e:
+            self.show_error(str(e))
+            return
+        self.destroy()
+        self.on_done()
+
+
+def parse_day(text: str) -> date:
+    return datetime.strptime(text.strip(), "%Y-%m-%d").date()
+
+
+class ReportDialog(Dialog):
+    """Download an Excel report for a date range or a whole month."""
+
+    def __init__(self, master, db: Database):
+        super().__init__(master, "Download report", 460, 400)
+        self.db = db
+        self.first = db.first_data_date()
+        today = date.today()
+        ctk.CTkLabel(self.body, text="Download money report", font=FONT["h3"], text_color=CHARCOAL).pack(anchor="w")
+        ctk.CTkLabel(self.body, text="Excel file: one sheet per day, and a Total sheet for the whole period.",
+                     font=FONT["small"], text_color=STONE, wraplength=400, justify="left").pack(anchor="w")
+        self.mode = ctk.CTkSegmentedButton(self.body, values=["Date range", "Month"], command=lambda v: self.switch(),
+                                           font=FONT["small"], height=32, fg_color=SOFT, selected_color=CHARCOAL,
+                                           selected_hover_color=HOVER, unselected_color=SOFT,
+                                           unselected_hover_color="#d8d3c7", text_color=CHARCOAL)
+        self.mode.set("Date range")
+        self.mode.pack(fill="x", pady=(12, 10))
+
+        self.range_box = ctk.CTkFrame(self.body, fg_color="transparent")
+        self.range_box.grid_columnconfigure((0, 1), weight=1, uniform="r")
+        field_label(self.range_box, "From (YYYY-MM-DD)").grid(row=0, column=0, sticky="w")
+        field_label(self.range_box, "To (YYYY-MM-DD)").grid(row=0, column=1, sticky="w", padx=(10, 0))
+        self.start = entry(self.range_box)
+        self.start.grid(row=1, column=0, sticky="ew")
+        self.end = entry(self.range_box)
+        self.end.grid(row=1, column=1, sticky="ew", padx=(10, 0))
+        self.start.insert(0, f"{self.first or today:%Y-%m-%d}")
+        self.end.insert(0, f"{today:%Y-%m-%d}")
+        hint = (f"Data starts on {self.first:%d %b %Y}. Dates must be between that day and today."
+                if self.first else "There's no data yet.")
+        ctk.CTkLabel(self.range_box, text=hint, font=FONT["small"], text_color=STONE, wraplength=400,
+                     justify="left").grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+        self.month_box = ctk.CTkFrame(self.body, fg_color="transparent")
+        self.month_box.grid_columnconfigure((0, 1), weight=1, uniform="m")
+        self.months = []                       # [(label, year, month)] from the first data month to now
+        if self.first:
+            y, m = self.first.year, self.first.month
+            while (y, m) <= (today.year, today.month):
+                self.months.append((f"{calendar.month_name[m]} {y}", y, m))
+                y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+        years = sorted({y for _, y, _ in self.months}, reverse=True) or [today.year]
+        field_label(self.month_box, "Month").grid(row=0, column=0, sticky="w")
+        field_label(self.month_box, "Year").grid(row=0, column=1, sticky="w", padx=(10, 0))
+        opt = dict(height=38, fg_color=WHITE, button_color=SOFT, button_hover_color="#d8d3c7", text_color=CHARCOAL,
+                   dropdown_fg_color=WHITE, dropdown_text_color=CHARCOAL, dropdown_hover_color=SOFT,
+                   font=FONT["body"], dropdown_font=FONT["body"], corner_radius=8)
+        self.month_var = ctk.StringVar(value=calendar.month_name[today.month])
+        self.year_var = ctk.StringVar(value=str(years[0]))
+        ctk.CTkOptionMenu(self.month_box, variable=self.month_var, values=list(calendar.month_name)[1:],
+                          **opt).grid(row=1, column=0, sticky="ew")
+        ctk.CTkOptionMenu(self.month_box, variable=self.year_var, values=[str(y) for y in years],
+                          **opt).grid(row=1, column=1, sticky="ew", padx=(10, 0))
+        ctk.CTkLabel(self.month_box, text="The current month runs up to today.", font=FONT["small"],
+                     text_color=STONE).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+        self.switch()
+        self.ok = self.buttons("Download", self.download)
+
+    def switch(self):
+        style_segmented(self.mode)
+        self.error.pack_forget()
+        if self.mode.get() == "Month":
+            self.range_box.pack_forget()
+            self.month_box.pack(fill="x")
+        else:
+            self.month_box.pack_forget()
+            self.range_box.pack(fill="x")
+
+    def period(self) -> tuple[date, date]:
+        """The chosen period, or raises ValueError with a message for the user."""
+        today = date.today()
+        if self.mode.get() == "Month":
+            y = int(self.year_var.get())
+            m = list(calendar.month_name).index(self.month_var.get())
+            if self.first is None or (y, m) < (self.first.year, self.first.month) or (y, m) > (today.year, today.month):
+                raise ValueError(f"There's no data for {self.month_var.get()} {y}.")
+            start = max(date(y, m, 1), self.first)
+            end = min(date(y, m, calendar.monthrange(y, m)[1]), today)
+        else:
+            try:
+                start, end = parse_day(self.start.get()), parse_day(self.end.get())
+            except ValueError:
+                raise ValueError("Write dates like 2026-11-12 (year-month-day).")
+        error = self.db.check_period(start, end, today)
+        if error:
+            raise ValueError(error)
+        return start, end
+
+    def download(self):
+        try:
+            start, end = self.period()
+        except ValueError as e:
+            self.show_error(str(e))
+            return
+        import report   # needs openpyxl; imported here so the rest of the app works without it
+        self.grab_release()
+        path = filedialog.asksaveasfilename(parent=self, title="Save report", defaultextension=".xlsx",
+                                            initialfile=report.default_filename(start, end),
+                                            filetypes=[("Excel workbook", "*.xlsx")])
+        self._grab()
+        if not path:
+            return
+        try:
+            report.build_report(self.db, start, end, path)
+        except PermissionError:
+            self.show_error("Couldn't save. Is that file open in Excel? Close it and try again.")
+            return
+        except (OSError, ValueError) as e:
+            self.show_error(str(e))
+            return
+        master = self.master
+        self.destroy()
+        ConfirmDialog(master, "Report saved", f"Saved {os.path.basename(path)}\n"
+                                              f"({start:%d %b %Y} to {end:%d %b %Y}).", "OK", lambda: None,
+                      danger=False)
+
+
 # ----------------------------------------------------------------------------- card widget
 class CardWidget(ctk.CTkFrame):
     """One open booking: live timer, running cost, items and actions."""
@@ -423,7 +805,7 @@ class CardWidget(ctk.CTkFrame):
             box.grid(row=3, column=0, sticky="ew", padx=12, pady=(8, 0))
             box.grid_columnconfigure(0, weight=1)
             for i, it in enumerate(items):
-                ctk.CTkLabel(box, text=it["name"], font=FONT["small"], text_color=CHARCOAL, anchor="w").grid(
+                ctk.CTkLabel(box, text=item_label(it), font=FONT["small"], text_color=CHARCOAL, anchor="w").grid(
                     row=i, column=0, sticky="w", padx=(10, 4))
                 ctk.CTkLabel(box, text=fmt_money(it["price"]), font=FONT["small"], text_color=CHARCOAL).grid(
                     row=i, column=1, sticky="e")
@@ -439,7 +821,7 @@ class CardWidget(ctk.CTkFrame):
 
         actions = ctk.CTkFrame(self, fg_color="transparent")
         actions.grid(row=6, column=0, sticky="ew", padx=12, pady=(0, 6))
-        small = [("+ Item", lambda: ItemDialog(self, self.db, card["id"], app.refresh_all), False)]
+        small = [("+ Items", lambda: MenuPickerDialog(self, self.db, self.card, app.refresh_all), False)]
         if card["kind"] == "room":
             small.append(("Discount", lambda: DiscountDialog(self, self.db, self.card, app.refresh_all), False))
         small.append(("Cancel", self.cancel, True))
@@ -585,7 +967,7 @@ class RoomsTab(BookingTab):
         self.start_btn.configure(state="normal" if enabled else "disabled")
         busy = len(all_rooms) - len(free)
         if not all_rooms:
-            self.info.configure(text="No rooms yet. Add rooms in the Room Settings tab.")
+            self.info.configure(text="No rooms yet. Add rooms in the Settings tab.")
         else:
             self.info.configure(text=f"{len(free)} free · {busy} busy out of {len(all_rooms)} room(s).\n"
                                      "Busy rooms are hidden from the list until checkout.")
@@ -624,16 +1006,18 @@ class HallTab(BookingTab):
             n = int(self.chairs.get())
         except ValueError:
             n = 1
-        n = max(1, min(HALL_TOTAL_CHAIRS, n + delta))
+        n = max(1, min(self.db.hall_chairs_total(), n + delta))
         self.chairs.delete(0, "end")
         self.chairs.insert(0, str(n))
 
     def refresh(self):
         super().refresh()
         free = self.db.free_chairs()
-        self.free_label.configure(text=f"Free chairs: {free} / {HALL_TOTAL_CHAIRS}")
+        self.free_label.configure(text=f"Free chairs: {free} / {self.db.hall_chairs_total()}")
         self.start_btn.configure(state="normal" if free > 0 else "disabled")
-        self.info.configure(text="Per chair: 15 + 15 + 10 + 10 for hours 1–4 (max 50).\n"
+        tiers = self.db.hall_tiers()
+        self.info.configure(text=f"Per chair: {' + '.join(fmt_money(t) for t in tiers)} for hours 1–{len(tiers)} "
+                                 f"(max {fmt_money(sum(tiers))}).\n"
                                  "Minimum 1 hour. Under 30 min extra is dropped, 30 min or more counts "
                                  "as a full hour.\nThe whole group starts together; chairs can't be added "
                                  "later.")
@@ -668,6 +1052,8 @@ class MoneyTab(ctk.CTkFrame):
         ghost_button(bar, "Today", self.go_today, width=70, height=38).pack(side="left", padx=(8, 0))
         primary_button(bar, "+ Add expense", lambda: ExpenseDialog(self, self.db, self.refresh),
                        width=150).pack(side="right")
+        ghost_button(bar, "Download report", lambda: ReportDialog(self, self.db), width=150,
+                     height=38).pack(side="right", padx=(0, 10))
 
         kpis = ctk.CTkFrame(self, fg_color="transparent")
         kpis.pack(fill="x", pady=(14, 0))
@@ -794,12 +1180,96 @@ class MoneyTab(ctk.CTkFrame):
                       "Delete", lambda: (self.db.delete_expense(e["id"]), self.refresh()))
 
 
-class RoomSettingsTab(ctk.CTkFrame):
+class MenuTab(ctk.CTkFrame):
+    """The menu used by "+ Items" on every card. Add, edit or remove drinks, food and add-ons."""
+
     def __init__(self, master, app: "MainView"):
         super().__init__(master, fg_color="transparent")
         self.app, self.db = app, app.db
         bar = ctk.CTkFrame(self, fg_color="transparent")
         bar.pack(fill="x")
+        ctk.CTkLabel(bar, text="Menu", font=FONT["h2"], text_color=CHARCOAL).pack(side="left")
+        primary_button(bar, "+ New item", lambda: MenuItemDialog(self, self.db, app.refresh_all),
+                       width=140).pack(side="right")
+        ctk.CTkLabel(self, text="Cards can only add items from this menu. A price change applies to items added "
+                                "from now on; items already on a card or bill keep their price.",
+                     font=FONT["small"], text_color=STONE, anchor="w").pack(fill="x", pady=(4, 10))
+        self.list = ctk.CTkScrollableFrame(self, fg_color=WHITE, corner_radius=12, border_width=1,
+                                           border_color=SOFT)
+        self.list.pack(fill="both", expand=True)
+        self.list.grid_columnconfigure(0, weight=1)
+        self._shown = None
+
+    def refresh(self):
+        items = self.db.list_menu()
+        key = [tuple(r) for r in items]
+        if key == self._shown:      # skip rebuilding a long list when nothing changed
+            return
+        self._shown = key
+        for w in self.list.winfo_children():
+            w.destroy()
+        if not items:
+            ctk.CTkLabel(self.list, text="The menu is empty. Click “+ New item” to add one.", font=FONT["body"],
+                         text_color=STONE).grid(row=0, column=0, padx=16, pady=16, sticky="w")
+            return
+        r, last = 0, None
+        for it in items:
+            if it["category"] != last:
+                last = it["category"]
+                head = ctk.CTkFrame(self.list, fg_color="transparent")
+                head.grid(row=r, column=0, columnspan=4, sticky="ew", padx=8, pady=(14 if r else 6, 2))
+                field_label(head, last).pack(side="left")
+                ghost_button(head, f"+ Add to {last}",
+                             lambda c=last: MenuItemDialog(self, self.db, self.app.refresh_all, category=c),
+                             width=10, height=24).pack(side="left", padx=10)
+                r += 1
+            ctk.CTkLabel(self.list, text=it["name"], font=FONT["bold"], text_color=CHARCOAL, anchor="w").grid(
+                row=r, column=0, sticky="w", padx=16, pady=2)
+            ctk.CTkLabel(self.list, text=price_text(Database.item_prices(it)) + f"  {CURRENCY}", font=FONT["body"],
+                         text_color=CHARCOAL).grid(row=r, column=1, padx=16, sticky="e")
+            ghost_button(self.list, "Edit", lambda i=it: MenuItemDialog(self, self.db, self.app.refresh_all, i),
+                         width=60, height=28).grid(row=r, column=2, padx=4)
+            ghost_button(self.list, "Remove", lambda i=it: self.remove(i), danger=True, width=70,
+                         height=28).grid(row=r, column=3, padx=(4, 12))
+            r += 1
+
+    def remove(self, item):
+        ConfirmDialog(self, "Remove item?", f"\"{item['name']}\" will be taken off the menu. Bills that already "
+                                            "have it keep its name and price.", "Remove",
+                      lambda: (self.db.remove_menu_item(item["id"]), self.app.refresh_all()))
+
+
+class SettingsTab(ctk.CTkScrollableFrame):
+    """Hall (chairs and price per chair per hour) and rooms (name and price per hour)."""
+
+    def __init__(self, master, app: "MainView"):
+        super().__init__(master, fg_color="transparent")
+        self.app, self.db = app, app.db
+
+        ctk.CTkLabel(self, text="Hall", font=FONT["h2"], text_color=CHARCOAL, anchor="w").pack(fill="x")
+        ctk.CTkLabel(self, text="New values apply to new hall bookings; cards already open keep the prices they "
+                                "started with. A chair never pays more than the sum of the hours below.",
+                     font=FONT["small"], text_color=STONE, anchor="w").pack(fill="x", pady=(4, 10))
+        hall = panel(self)
+        hall.pack(fill="x")
+        inner = ctk.CTkFrame(hall, fg_color="transparent")
+        inner.pack(fill="x", padx=16, pady=14)
+        field_label(inner, "Chairs in the hall").grid(row=0, column=0, sticky="w")
+        self.chairs = entry(inner, "16", width=110, justify="center")
+        self.chairs.grid(row=1, column=0, sticky="w", padx=(0, 28))
+        self.tiers = []
+        for i in range(4):
+            field_label(inner, f"Hour {i + 1} ({CURRENCY}/chair)").grid(row=0, column=i + 1, sticky="w",
+                                                                       padx=(0, 10))
+            e = entry(inner, "", width=120, justify="center")
+            e.grid(row=1, column=i + 1, sticky="w", padx=(0, 10))
+            self.tiers.append(e)
+        primary_button(inner, "Save hall", self.save_hall, width=120).grid(row=1, column=5, padx=(18, 0))
+        self.hall_msg = ctk.CTkLabel(inner, text="", font=FONT["small"], text_color=STONE, anchor="w")
+        self.hall_msg.grid(row=2, column=0, columnspan=6, sticky="w", pady=(8, 0))
+
+        bar = ctk.CTkFrame(self, fg_color="transparent")
+        bar.pack(fill="x", pady=(26, 0))
         ctk.CTkLabel(bar, text="Rooms", font=FONT["h2"], text_color=CHARCOAL).pack(side="left")
         primary_button(bar, "+ New room", lambda: RoomDialog(self, self.db, app.refresh_all),
                        width=140).pack(side="right")
@@ -808,6 +1278,31 @@ class RoomSettingsTab(ctk.CTkFrame):
                      font=FONT["small"], text_color=STONE, anchor="w").pack(fill="x", pady=(4, 10))
         self.list = panel(self)
         self.list.pack(fill="x")
+        self.fill_hall()
+
+    def fill_hall(self):
+        self.chairs.delete(0, "end")
+        self.chairs.insert(0, str(self.db.hall_chairs_total()))
+        for e, t in zip(self.tiers, self.db.hall_tiers() + [0] * 4):
+            e.delete(0, "end")
+            e.insert(0, fmt_money(t).replace(",", ""))
+        tiers = self.db.hall_tiers()
+        self.hall_msg.configure(text=f"Now: {self.db.hall_chairs_total()} chairs · per chair "
+                                     f"{' + '.join(fmt_money(t) for t in tiers)} = max {money(sum(tiers))}.",
+                                text_color=STONE)
+
+    def save_hall(self):
+        try:
+            self.db.set_hall_settings(self.chairs.get(), [parse_number(e.get()) or 0 for e in self.tiers])
+        except ValueError:
+            self.hall_msg.configure(text="Prices must be numbers.", text_color=DANGER)
+            return
+        except BookingError as e:
+            self.hall_msg.configure(text=str(e), text_color=DANGER)
+            return
+        self.app.refresh_all()
+        self.fill_hall()
+        self.hall_msg.configure(text=self.hall_msg.cget("text") + "  Saved.", text_color=CHARCOAL)
 
     def refresh(self):
         for w in self.list.winfo_children():
@@ -906,14 +1401,15 @@ class MainView(ctk.CTkFrame):
         self.tabs.pack(fill="both", expand=True, padx=20, pady=(8, 16))
         self.tabs._segmented_button.configure(font=FONT["bold"], height=36,
                                               text_color=CHARCOAL, )
-        names = ["Rooms", "Hall", "Money", "Room Settings"]
+        names = ["Rooms", "Hall", "Menu", "Money", "Settings"]
         for n in names:
             self.tabs.add(n)
         self.rooms = RoomsTab(self.tabs.tab("Rooms"), self)
         self.hall = HallTab(self.tabs.tab("Hall"), self)
+        self.menu = MenuTab(self.tabs.tab("Menu"), self)
         self.money = MoneyTab(self.tabs.tab("Money"), self)
-        self.settings = RoomSettingsTab(self.tabs.tab("Room Settings"), self)
-        for t in (self.rooms, self.hall, self.money, self.settings):
+        self.settings = SettingsTab(self.tabs.tab("Settings"), self)
+        for t in (self.rooms, self.hall, self.menu, self.money, self.settings):
             t.pack(fill="both", expand=True, pady=(6, 0))
         self._style_tabs()
         self.refresh_all()
@@ -932,6 +1428,7 @@ class MainView(ctk.CTkFrame):
     def refresh_all(self):
         self.rooms.refresh()
         self.hall.refresh()
+        self.menu.refresh()
         self.money.refresh()
         self.settings.refresh()
 

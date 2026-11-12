@@ -1,0 +1,14 @@
+CLAUDE.md
+
+# Real data: never upload
+upspace.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Build output
+build/
+dist/
+*.spec
+__pycache__/
+*.pyc

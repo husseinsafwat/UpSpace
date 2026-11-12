@@ -1,7 +1,9 @@
 ; UpSpace installer (per-user, no admin rights needed)
 Unicode true
 !define APPNAME "UpSpace"
-!define APPVER "1.1"
+!ifndef APPVER
+  !define APPVER "1.2"
+!endif
 Name "${APPNAME} Bookings & Billing"
 OutFile "..\dist\UpSpace-Setup.exe"
 InstallDir "$LOCALAPPDATA\Programs\${APPNAME}"
