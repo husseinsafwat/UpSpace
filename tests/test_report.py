@@ -22,13 +22,13 @@ class Report(unittest.TestCase):
         t1 = datetime.combine(self.d1, datetime.min.time()).replace(hour=10)
         c = self.db.open_room_card("Ali", "", self.room, when=t1)
         self.db.add_items(c, [(self.menu["Latte"], "M", 2), (self.menu["Flavor"], None, 1)])
-        self.db.close_card(c, end=t1 + timedelta(minutes=90))                 # 180 + 145
+        self.db.close_card(c, end=t1 + timedelta(minutes=90), payments=[(self.db.cash_account_id(), None)])                 # 180 + 145
         h = self.db.open_hall_card("G", "", 3, when=t1)
         self.db.add_items(h, [(self.menu["Latte"], "M", 1)])
-        self.db.close_card(h, end=t1 + timedelta(minutes=160))                # 120 + 65
-        self.db.add_expense("Milk", 70, when=t1 + timedelta(hours=1))
+        self.db.close_card(h, end=t1 + timedelta(minutes=160), payments=[(self.db.cash_account_id(), None)])                # 120 + 65
+        self.db.add_expense("Milk", 70, when=t1 + timedelta(hours=1), payments=[(self.db.cash_account_id(), None)])
         t3 = datetime.combine(self.d3, datetime.min.time()).replace(hour=0, minute=5)
-        self.db.add_expense("Sugar", 30, when=t3)
+        self.db.add_expense("Sugar", 30, when=t3, payments=[(self.db.cash_account_id(), None)])
 
     def test_period_checks(self):
         today = date.today()
@@ -54,8 +54,9 @@ class Report(unittest.TestCase):
         total = wb["Total"]
         self.assertEqual(total.max_row >= 8, True)
         self.assertEqual(total.cell(row=8, column=1).value, "TOTAL")
-        self.assertEqual(total.cell(row=8, column=10).value, 410)
-        self.assertEqual(total.cell(row=6, column=8).value, 0)                   # quiet day = 0
+        self.assertEqual(total.cell(row=8, column=14).value, 410)
+        self.assertEqual(total.cell(row=8, column=10).value, 510)                  # all paid in cash
+        self.assertEqual(total.cell(row=6, column=9).value, 0)                   # quiet day = 0
         values = [c.value for row in wb[f"{self.d1:%Y-%m-%d}"].iter_rows() for c in row]
         self.assertIn("Latte", values)
         self.assertNotIn("Ali", values)                                          # no individual bills

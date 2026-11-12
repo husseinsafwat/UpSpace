@@ -65,7 +65,7 @@ class CartToCard(unittest.TestCase):
         self.db.add_items(cid, [(self.ids["Latte"], "S", 2), (self.ids["Tea"], None, 1),
                                 (self.ids["Flavor"], None, 1), (self.ids["Tea"], None, 0)])
         self.assertEqual(len(self.db.card_items(cid)), 3)            # qty 0 skipped
-        bill = self.db.close_card(cid, end=start + timedelta(minutes=160))
+        bill = self.db.close_card(cid, end=start + timedelta(minutes=160), payments=[(self.db.cash_account_id(), None)])
         self.assertEqual(bill.time_cost, 120)                         # 3 chairs x 40
         self.assertEqual(bill.items_total, 110 + 15 + 15)
         self.assertEqual(bill.total, 260)
@@ -94,13 +94,13 @@ class HallSettings(unittest.TestCase):
         self.assertEqual(self.db.free_chairs(), 20)
         start = datetime.now() - timedelta(hours=10)
         cid = self.db.open_hall_card("G", "", 2, when=start)
-        self.assertEqual(self.db.close_card(cid, end=start + timedelta(hours=10)).time_cost, 100)  # cap 50 x 2
+        self.assertEqual(self.db.close_card(cid, end=start + timedelta(hours=10), payments=[(self.db.cash_account_id(), None)]).time_cost, 100)  # cap 50 x 2
 
     def test_open_card_keeps_its_prices(self):
         start = datetime.now() - timedelta(minutes=160)
         cid = self.db.open_hall_card("G", "", 3, when=start)
         self.db.set_hall_settings(16, [30, 30, 30, 30])
-        self.assertEqual(self.db.close_card(cid, end=start + timedelta(minutes=160)).time_cost, 120)
+        self.assertEqual(self.db.close_card(cid, end=start + timedelta(minutes=160), payments=[(self.db.cash_account_id(), None)]).time_cost, 120)
 
     def test_validation(self):
         self.db.open_hall_card("G", "", 10)

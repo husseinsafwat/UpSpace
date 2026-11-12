@@ -26,17 +26,18 @@ class DatabaseFlow(unittest.TestCase):
         menu = {r["name"]: r["id"] for r in self.db.list_menu()}
         self.db.add_items(cid, [(menu["Tea"], None, 1), (menu["Herbs"], None, 1), (menu["Flavor"], None, 1)])
         self.db.set_discount(cid, DISCOUNT_EGP, 20)          # 100/hr
-        bill = self.db.close_card(cid, end=start + timedelta(minutes=95))
+        bill = self.db.close_card(cid, end=start + timedelta(minutes=95), payments=[(self.db.cash_account_id(), None)])
         self.assertEqual(bill.time_cost, round(95 / 60 * 100, 2))
         self.assertEqual(bill.items_total, 50)                # 15 + 20 + 15
-        self.assertEqual(bill.total, round(95 / 60 * 100 + 50, 2))
+        self.assertEqual(bill.exact_total, round(95 / 60 * 100 + 50, 2))   # 208.33
+        self.assertEqual(bill.total, 208)                                   # rounded to the pound
         self.assertEqual(len(self.db.free_rooms()), 1)       # room freed
 
     def test_pct_discount(self):
         start = datetime.now() - timedelta(minutes=60)
         cid = self.db.open_room_card("Ali", "", self.room, when=start)
         self.db.set_discount(cid, DISCOUNT_PCT, 50)
-        self.assertEqual(self.db.close_card(cid, end=start + timedelta(minutes=60)).time_cost, 60)
+        self.assertEqual(self.db.close_card(cid, end=start + timedelta(minutes=60), payments=[(self.db.cash_account_id(), None)]).time_cost, 60)
 
     def test_hall_capacity(self):
         self.db.open_hall_card("Group", "", 10)
@@ -55,10 +56,10 @@ class DatabaseFlow(unittest.TestCase):
         r = self.db.open_room_card("Ali", "", self.room, when=start)
         coffee = next(m["id"] for m in self.db.list_menu() if m["name"] == "French Coffee")
         self.db.add_items(r, [(coffee, None, 1)])                      # 40
-        self.db.close_card(r, end=start + timedelta(minutes=90))       # 180 + 40
+        self.db.close_card(r, end=start + timedelta(minutes=90), payments=[(self.db.cash_account_id(), None)])       # 180 + 40
         h = self.db.open_hall_card("G", "", 3, when=start)
-        self.db.close_card(h, end=start + timedelta(minutes=160))      # 3 x 40 = 120
-        self.db.add_expense("Milk", 70, when=start + timedelta(hours=1))
+        self.db.close_card(h, end=start + timedelta(minutes=160), payments=[(self.db.cash_account_id(), None)])      # 3 x 40 = 120
+        self.db.add_expense("Milk", 70, when=start + timedelta(hours=1), payments=[(self.db.cash_account_id(), None)])
         s = self.db.summary(start.date(), start.date())
         self.assertEqual(s["room_time_income"], 180)
         self.assertEqual(s["hall_time_income"], 120)

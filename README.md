@@ -24,7 +24,8 @@ Back this file up (copy it somewhere safe) now and then.
 | Hall time | minimum 1 hour; after that, under 30 min extra is dropped, 30 min or more = full hour. Per chair: 15 + 15 + 10 + 10 for hours 1–4 (max 50, set in **Settings**). × number of chairs. No discount. |
 | Hall chairs | 16 in total (set in **Settings**). A booking can't take more than the free chairs. A group starts together on one card; chairs can't be added later, only drinks. |
 | Drinks, food & add-ons | only from the **Menu** tab. On a card, **+ Items** opens the menu: press + / − per item (and size), then **Review & confirm**. Add-ons are their own lines. |
-| Total | time cost + drinks/add-ons. |
+| Total | time cost + drinks/add-ons, **rounded to the nearest pound** (158.33 → 158, 158.50 → 159). |
+| Payment | required at checkout. Tick one account (Cash, or a Vodafone Cash / InstaPay account) and it takes the whole bill; tick two or more and type each amount: they must add up **exactly** to the total, otherwise a popup explains the difference. Expenses follow the same rules. |
 | Money page | for the chosen day (today by default): money in from closed bills, minus expenses = total now. Open cards are shown separately and counted at checkout. |
 
 Room prices and hall prices are copied onto a card when it starts, so changing them only affects new bookings.
@@ -39,6 +40,10 @@ On the Money page, **Download report** saves an .xlsx file for a date range (def
 up to today) or for one month. Each day with activity gets its own sheet (summary, items consumed, expenses);
 the last sheet, **Total**, has one row per day and the totals for the whole period. Dates before the first day
 with data or after today are refused.
+
+## Payment accounts
+Settings → Payment accounts: Cash is always there; add every Vodafone Cash number and InstaPay account you use.
+The Money page and the Excel report show money in, money out and the balance for each account and method.
 
 ## Settings
 The **Settings** tab holds the hall (number of chairs, price per chair for hours 1–4) and the rooms

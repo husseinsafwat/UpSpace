@@ -9,6 +9,7 @@ HALL  : billed hours = at least 1; after that a leftover under 30 min is dropped
         hall card when it starts.
         No discount for the hall.
 ITEMS : drinks / add-ons are added at full price, never discounted.
+TOTAL : time + items, rounded to the nearest pound.
 """
 from __future__ import annotations
 
@@ -68,6 +69,12 @@ def tiers_from_text(text: str | None):
     if not text:
         return None
     return [float(x) for x in text.split(",") if x.strip()]
+
+
+def round_pound(value: float) -> float:
+    """Bill totals are rounded to the nearest pound; .50 goes up (158.33 -> 158, 158.50 -> 159)."""
+    import math
+    return float(math.floor(float(value) + 0.5 + 1e-9))
 
 
 def validate_discount(discount_type: str, discount_value: float, price_per_hour: float) -> str | None:

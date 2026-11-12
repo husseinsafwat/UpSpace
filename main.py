@@ -18,7 +18,7 @@ import customtkinter as ctk
 import pricing
 from config import (CHARCOAL, CURRENCY, DANGER, DB_FILENAME, IVORY, LOGIN_EMAIL, LOGIN_PASSWORD_SHA256, SOFT,
                     STONE, WHITE)
-from db import SIZES, BookingError, Database, item_label
+from db import METHODS, SIZES, BookingError, Database, PaymentError, account_label, item_label
 from pricing import fmt_duration, fmt_money
 
 try:
@@ -449,22 +449,112 @@ class ConfirmDialog(Dialog):
         self.buttons(ok_text, ok, danger=danger)
 
 
+def payment_error(master, message: str):
+    ConfirmDialog(master, "Payment doesn't match", message, "OK", lambda: None, danger=False)
+
+
+class PaymentPicker(ctk.CTkFrame):
+    """Tick the account(s) used. One ticked → it takes the whole amount. Two or more → type each amount;
+    they must add up exactly to the total (checked again in db._check_payments)."""
+
+    def __init__(self, master, db: Database, get_total, existing=None, title="Paid with"):
+        super().__init__(master, fg_color="transparent")
+        self.get_total = get_total
+        self.rows = {}
+        field_label(self, title + " (required)").pack(anchor="w")
+        box = ctk.CTkScrollableFrame(self, fg_color=WHITE, corner_radius=10, border_width=1, border_color=SOFT,
+                                     height=170)
+        box.pack(fill="both", expand=True, pady=(4, 0))
+        box.grid_columnconfigure(0, weight=1)
+        existing = {p["account_id"]: p["amount"] for p in (existing or [])}
+        for i, acc in enumerate(db.list_accounts()):
+            var = ctk.BooleanVar(value=acc["id"] in existing)
+            ctk.CTkCheckBox(box, text=account_label(acc), variable=var, command=self.update, font=FONT["body"],
+                            text_color=CHARCOAL, fg_color=CHARCOAL, hover_color=HOVER, border_color=STONE,
+                            checkbox_width=20, checkbox_height=20).grid(row=i, column=0, sticky="w", padx=10, pady=4)
+            amount = entry(box, "", width=96, justify="right")
+            amount.grid(row=i, column=1, padx=(6, 10), pady=4)
+            amount.bind("<KeyRelease>", lambda e: self.update(typing=True))
+            if acc["id"] in existing and len(existing) > 1:
+                amount.insert(0, fmt_money(existing[acc["id"]]).replace(",", ""))
+            self.rows[acc["id"]] = (var, amount)
+        self.remaining = ctk.CTkLabel(self, text="", font=FONT["small"], text_color=STONE, anchor="w", justify="left")
+        self.remaining.pack(fill="x", pady=(6, 0))
+        self.update()
+
+    def checked(self):
+        return [aid for aid, (var, _) in self.rows.items() if var.get()]
+
+    def update(self, typing=False):
+        try:
+            total = self.get_total()
+        except (TypeError, ValueError):
+            total = None
+        checked = self.checked()
+        for aid, (var, amount) in self.rows.items():
+            if len(checked) == 1 and var.get():
+                amount.configure(state="normal")
+                amount.delete(0, "end")
+                amount.insert(0, fmt_money(total).replace(",", "") if total else "")
+                amount.configure(state="disabled", text_color=STONE)
+            elif var.get():
+                amount.configure(state="normal", text_color=CHARCOAL)
+                if not typing and len(checked) > 1 and amount.get() == fmt_money(total or 0).replace(",", ""):
+                    amount.delete(0, "end")
+            else:
+                amount.configure(state="normal")
+                amount.delete(0, "end")
+                amount.configure(state="disabled")
+        if not checked:
+            self.remaining.configure(text="Tick Cash, Vodafone Cash or InstaPay.", text_color=STONE)
+        elif len(checked) == 1:
+            self.remaining.configure(text="The whole amount is paid with this account.", text_color=STONE)
+        else:
+            paid = 0.0
+            for aid in checked:
+                try:
+                    paid += parse_number(self.rows[aid][1].get()) or 0
+                except ValueError:
+                    pass
+            if total is None:
+                self.remaining.configure(text=f"Entered: {money(paid)}", text_color=STONE)
+                return
+            left = round(total - paid, 2)
+            if abs(left) < 0.005:
+                self.remaining.configure(text=f"✓ {money(paid)} — matches exactly.", text_color=CHARCOAL)
+            elif left > 0:
+                self.remaining.configure(text=f"Entered {money(paid)} · still {money(left)} to go.", text_color=DANGER)
+            else:
+                self.remaining.configure(text=f"Entered {money(paid)} · {money(-left)} too much.", text_color=DANGER)
+
+    def get(self):
+        """[(account_id, amount text or None)] for db.close_card / add_expense."""
+        checked = self.checked()
+        if len(checked) == 1:
+            return [(checked[0], None)]
+        return [(aid, self.rows[aid][1].get()) for aid in checked]
+
+
 class CheckoutDialog(Dialog):
-    """Shows the bill (time frozen when opened). Confirm closes the card."""
+    """Shows the bill (time frozen when opened) and how it was paid. Confirm closes the card."""
 
     def __init__(self, master, db: Database, card, on_done):
         items = db.card_items(card["id"])
-        super().__init__(master, "Checkout", 460, min(640, 430 + 26 * len(items)))
+        super().__init__(master, "Checkout", 960, min(660, max(520, 430 + 26 * len(items))))
         self.db, self.card, self.on_done = db, card, on_done
         self.end = datetime.now()
-        bill = db.compute_bill(card, self.end)
+        self.bill = bill = db.compute_bill(card, self.end)
 
+        self.body.grid_columnconfigure(0, weight=1, uniform="c")
+        self.body.grid_columnconfigure(1, weight=1, uniform="c")
+        left = ctk.CTkFrame(self.body, fg_color="transparent")
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 16))
         place = card["room_name"] if card["kind"] == "room" else f"Hall · {card['chairs']} chair(s)"
-        ctk.CTkLabel(self.body, text=card["customer_name"], font=FONT["h2"], text_color=CHARCOAL).pack(anchor="w")
-        ctk.CTkLabel(self.body, text=place, font=FONT["body"], text_color=STONE).pack(anchor="w")
+        ctk.CTkLabel(left, text=card["customer_name"], font=FONT["h2"], text_color=CHARCOAL).pack(anchor="w")
+        ctk.CTkLabel(left, text=place, font=FONT["body"], text_color=STONE).pack(anchor="w")
 
-        box = panel(self.body)
-        box.pack(fill="x", pady=(12, 0))
+        box = ctk.CTkScrollableFrame(left, fg_color=WHITE, corner_radius=12, border_width=1, border_color=SOFT)
+        box.pack(fill="both", expand=True, pady=(12, 0))
         box.grid_columnconfigure(0, weight=1)
         rows = [("Started", card["start_time"][11:16]), ("Ended", self.end.strftime("%H:%M")),
                 ("Time spent", fmt_duration(bill.minutes))]
@@ -482,21 +572,40 @@ class CheckoutDialog(Dialog):
         for it in items:
             rows.append((f"  {item_label(it)}", money(it["price"])))
         rows.append(("Drinks & add-ons", money(bill.items_total)))
+        if bill.rounding:
+            rows.append(("Rounded to the pound", f"{money(bill.exact_total)} → {money(bill.total)}"))
         for i, (k, v) in enumerate(rows):
             ctk.CTkLabel(box, text=k, font=FONT["small"], text_color=STONE, anchor="w").grid(
-                row=i, column=0, sticky="w", padx=14, pady=(8 if i == 0 else 1, 1))
+                row=i, column=0, sticky="w", padx=10, pady=(8 if i == 0 else 1, 1))
             ctk.CTkLabel(box, text=v, font=FONT["small"], text_color=CHARCOAL, anchor="e").grid(
-                row=i, column=1, sticky="e", padx=14)
-        total = ctk.CTkFrame(box, fg_color=CHARCOAL, corner_radius=8)
-        total.grid(row=len(rows), column=0, columnspan=2, sticky="ew", padx=10, pady=10)
+                row=i, column=1, sticky="e", padx=10)
+        total = ctk.CTkFrame(left, fg_color=CHARCOAL, corner_radius=8)
+        total.pack(fill="x", pady=(10, 0))
         ctk.CTkLabel(total, text="TOTAL", font=FONT["bold"], text_color=IVORY).pack(side="left", padx=12, pady=8)
         ctk.CTkLabel(total, text=money(bill.total), font=FONT["h2"], text_color=IVORY).pack(side="right", padx=12)
 
-        self.buttons("Confirm & close", self.confirm, cancel_text="Back")
+        right = ctk.CTkFrame(self.body, fg_color="transparent")
+        right.grid(row=0, column=1, sticky="nsew")
+        self.body.grid_rowconfigure(0, weight=1)
+        ctk.CTkLabel(right, text="Payment", font=FONT["h3"], text_color=CHARCOAL).pack(anchor="w")
+        ctk.CTkLabel(right, text="One account: it pays the whole bill. More than one: type each amount; they must "
+                                 "add up exactly to the total.", font=FONT["small"], text_color=STONE,
+                     wraplength=420, justify="left").pack(anchor="w", pady=(2, 8))
+        self.picker = PaymentPicker(right, db, lambda: self.bill.total)
+        self.picker.pack(fill="both", expand=True)
+
+        row = ctk.CTkFrame(self.body, fg_color="transparent")
+        row.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(14, 0))
+        primary_button(row, "Confirm & close", self.confirm, width=170).pack(side="right")
+        ghost_button(row, "Back", self.destroy, width=100, height=38).pack(side="right", padx=(0, 10))
+        self.bind("<Return>", lambda e: self.confirm())
 
     def confirm(self):
         try:
-            self.db.close_card(self.card["id"], self.end)
+            self.db.close_card(self.card["id"], self.end, payments=self.picker.get())
+        except PaymentError as e:
+            payment_error(self, str(e))
+            return
         except BookingError as e:
             self.show_error(str(e))
             return
@@ -506,7 +615,7 @@ class CheckoutDialog(Dialog):
 
 class ExpenseDialog(Dialog):
     def __init__(self, master, db: Database, on_done, expense=None):
-        super().__init__(master, "Expense", 400, 290)
+        super().__init__(master, "Expense", 480, 560)
         self.db, self.on_done, self.expense = db, on_done, expense
         ctk.CTkLabel(self.body, text="Edit expense" if expense else "Add expense", font=FONT["h3"],
                      text_color=CHARCOAL).pack(anchor="w")
@@ -520,18 +629,65 @@ class ExpenseDialog(Dialog):
             self.desc.insert(0, expense["description"])
             self.amount.insert(0, fmt_money(expense["amount"]).replace(",", ""))
         self.buttons("Save", self.save)
+        self.picker = PaymentPicker(self.body, db, lambda: parse_number(self.amount.get()),
+                                    existing=db.payments_for("expense", expense["id"]) if expense else None,
+                                    title="Paid from")
+        self.picker.pack(fill="both", expand=True, pady=(12, 0))
+        self.amount.bind("<KeyRelease>", lambda e: self.picker.update())
         self.after(150, self.desc.focus_set)
 
     def save(self):
         try:
             amount = parse_number(self.amount.get())
             if self.expense:
-                self.db.update_expense(self.expense["id"], self.desc.get(), amount)
+                self.db.update_expense(self.expense["id"], self.desc.get(), amount, payments=self.picker.get())
             else:
-                self.db.add_expense(self.desc.get(), amount)
+                self.db.add_expense(self.desc.get(), amount, payments=self.picker.get())
         except ValueError:
             self.show_error("Amount must be a number.")
             return
+        except PaymentError as e:
+            payment_error(self, str(e))
+            return
+        except BookingError as e:
+            self.show_error(str(e))
+            return
+        self.destroy()
+        self.on_done()
+
+
+class AccountDialog(Dialog):
+    """Add / edit a Vodafone Cash or InstaPay account."""
+
+    def __init__(self, master, db: Database, on_done, account=None):
+        super().__init__(master, "Payment account", 420, 300)
+        self.db, self.on_done, self.account = db, on_done, account
+        ctk.CTkLabel(self.body, text="Edit account" if account else "New payment account", font=FONT["h3"],
+                     text_color=CHARCOAL).pack(anchor="w")
+        field_label(self.body, "Type").pack(anchor="w", pady=(12, 2))
+        self.method = ctk.CTkSegmentedButton(self.body, values=["Vodafone Cash", "InstaPay"], font=FONT["body"],
+                                             height=34, fg_color=SOFT, selected_color=CHARCOAL,
+                                             selected_hover_color=HOVER, unselected_color=SOFT,
+                                             unselected_hover_color="#d8d3c7", text_color=CHARCOAL,
+                                             command=lambda v: style_segmented(self.method))
+        self.method.set(METHODS[account["method"]] if account else "Vodafone Cash")
+        self.method.pack(fill="x")
+        style_segmented(self.method)
+        field_label(self.body, "Number (or InstaPay address)").pack(anchor="w", pady=(10, 2))
+        self.number = entry(self.body, "e.g. 0100 123 4567")
+        self.number.pack(fill="x")
+        if account:
+            self.number.insert(0, account["number"] or "")
+        self.buttons("Save", self.save)
+        self.after(150, self.number.focus_set)
+
+    def save(self):
+        method = "vodafone" if self.method.get() == "Vodafone Cash" else "instapay"
+        try:
+            if self.account:
+                self.db.update_account(self.account["id"], method, self.number.get())
+            else:
+                self.db.add_account(method, self.number.get())
         except BookingError as e:
             self.show_error(str(e))
             return
@@ -1090,6 +1246,10 @@ class MoneyTab(ctk.CTkFrame):
 
         right = panel(body)
         right.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+        ctk.CTkLabel(right, text="By payment account", font=FONT["h3"], text_color=CHARCOAL).pack(
+            anchor="w", padx=16, pady=(14, 4))
+        self.acc_box = ctk.CTkFrame(right, fg_color="transparent")
+        self.acc_box.pack(fill="x", padx=16)
         ctk.CTkLabel(right, text="Closed bills", font=FONT["h3"], text_color=CHARCOAL).pack(anchor="w", padx=16,
                                                                                        pady=(14, 4))
         self.bills = ctk.CTkScrollableFrame(right, fg_color="transparent")
@@ -1129,6 +1289,7 @@ class MoneyTab(ctk.CTkFrame):
             ("Hall chair-hours", f"{fmt_money(s['hall_chair_hours'])} h"),
             ("Hall time", money(s["hall_time_income"])),
             ("Drinks & add-ons", money(s["items_income"])),
+            ("Rounding to the pound", money(s["rounding"])),
             ("Money in", money(s["income_total"])),
             ("Expenses", "− " + money(s["expenses_total"])),
             ("Total now", money(s["net"])),
@@ -1139,6 +1300,16 @@ class MoneyTab(ctk.CTkFrame):
             ctk.CTkLabel(self.breakdown, text=k, font=f, text_color=CHARCOAL if strong else STONE,
                          anchor="w").grid(row=i, column=0, sticky="w", pady=1)
             ctk.CTkLabel(self.breakdown, text=v, font=f, text_color=CHARCOAL).grid(row=i, column=1, sticky="e")
+        self._clear(self.acc_box)
+        self.acc_box.grid_columnconfigure(0, weight=1)
+        for c, h in enumerate(("Account", "In", "Out", "Balance")):
+            field_label(self.acc_box, h).grid(row=0, column=c, sticky="w" if c == 0 else "e", padx=(0 if c == 0 else 16, 0))
+        for r, a in enumerate(s["accounts"], start=1):
+            ctk.CTkLabel(self.acc_box, text=a["label"] + ("" if a["active"] else " (removed)"), font=FONT["small"],
+                         text_color=CHARCOAL, anchor="w").grid(row=r, column=0, sticky="w", pady=1)
+            for c, k in enumerate(("in", "out", "balance"), start=1):
+                ctk.CTkLabel(self.acc_box, text=fmt_money(a[k]), font=FONT["bold"] if k == "balance" else FONT["small"],
+                             text_color=CHARCOAL).grid(row=r, column=c, sticky="e", padx=(16, 0))
 
         self._clear(self.exp_list)
         self.exp_list.grid_columnconfigure(1, weight=1)
@@ -1148,8 +1319,10 @@ class MoneyTab(ctk.CTkFrame):
         for i, e in enumerate(s["expenses"]):
             ctk.CTkLabel(self.exp_list, text=e["created_at"][11:16], font=FONT["small"], text_color=STONE).grid(
                 row=i, column=0, padx=(8, 8), sticky="w")
-            ctk.CTkLabel(self.exp_list, text=e["description"], font=FONT["body"], text_color=CHARCOAL,
-                         anchor="w").grid(row=i, column=1, sticky="w")
+            paid = self.db.payments_for("expense", e["id"])
+            how = " + ".join(p["label"].split(" · ")[0] for p in paid) or "not recorded"
+            ctk.CTkLabel(self.exp_list, text=f"{e['description']}\n{how}", font=FONT["small"], text_color=CHARCOAL,
+                         anchor="w", justify="left").grid(row=i, column=1, sticky="w", pady=2)
             ctk.CTkLabel(self.exp_list, text=money(e["amount"]), font=FONT["bold"], text_color=CHARCOAL).grid(
                 row=i, column=2, padx=8)
             acts = ctk.CTkFrame(self.exp_list, fg_color="transparent")
@@ -1168,8 +1341,10 @@ class MoneyTab(ctk.CTkFrame):
             place = c["room_name"] if c["kind"] == "room" else f"Hall × {c['chairs']}"
             ctk.CTkLabel(self.bills, text=c["end_time"][11:16], font=FONT["small"], text_color=STONE).grid(
                 row=i, column=0, padx=(8, 8), sticky="w")
-            ctk.CTkLabel(self.bills, text=f"{c['customer_name']}  ·  {place}", font=FONT["body"],
-                         text_color=CHARCOAL, anchor="w").grid(row=i, column=1, sticky="w")
+            paid = self.db.payments_for("card", c["id"])
+            how = " + ".join(p["label"].split(" · ")[0] for p in paid) or "not recorded"
+            ctk.CTkLabel(self.bills, text=f"{c['customer_name']}  ·  {place}\n{how}", font=FONT["small"],
+                         text_color=CHARCOAL, anchor="w", justify="left").grid(row=i, column=1, sticky="w", pady=2)
             ctk.CTkLabel(self.bills, text=fmt_duration(c["minutes"]), font=FONT["small"], text_color=STONE).grid(
                 row=i, column=2, padx=8)
             ctk.CTkLabel(self.bills, text=money(c["total"]), font=FONT["bold"], text_color=CHARCOAL).grid(
@@ -1278,6 +1453,17 @@ class SettingsTab(ctk.CTkScrollableFrame):
                      font=FONT["small"], text_color=STONE, anchor="w").pack(fill="x", pady=(4, 10))
         self.list = panel(self)
         self.list.pack(fill="x")
+
+        bar = ctk.CTkFrame(self, fg_color="transparent")
+        bar.pack(fill="x", pady=(26, 0))
+        ctk.CTkLabel(bar, text="Payment accounts", font=FONT["h2"], text_color=CHARCOAL).pack(side="left")
+        primary_button(bar, "+ New account", lambda: AccountDialog(self, self.db, app.refresh_all),
+                       width=150).pack(side="right")
+        ctk.CTkLabel(self, text="Cash is always there. Add each Vodafone Cash number and InstaPay account you use; "
+                                "checkout and expenses pick from this list.",
+                     font=FONT["small"], text_color=STONE, anchor="w").pack(fill="x", pady=(4, 10))
+        self.accounts = panel(self)
+        self.accounts.pack(fill="x", pady=(0, 16))
         self.fill_hall()
 
     def fill_hall(self):
@@ -1326,6 +1512,29 @@ class SettingsTab(ctk.CTkScrollableFrame):
                          width=60).grid(row=i, column=3, padx=4)
             ghost_button(self.list, "Remove", lambda r=r: self.remove(r), danger=True, width=70).grid(
                 row=i, column=4, padx=(4, 16))
+
+        for w in self.accounts.winfo_children():
+            w.destroy()
+        self.accounts.grid_columnconfigure(0, weight=1)
+        accounts = self.db.list_accounts()
+        for i, a in enumerate(accounts):
+            pad = (14 if i == 0 else 4, 14 if i == len(accounts) - 1 else 4)
+            ctk.CTkLabel(self.accounts, text=account_label(a), font=FONT["bold"], text_color=CHARCOAL,
+                         anchor="w").grid(row=i, column=0, sticky="w", padx=16, pady=pad)
+            if a["method"] == "cash":
+                ctk.CTkLabel(self.accounts, text="Always available", font=FONT["small"], text_color=STONE).grid(
+                    row=i, column=1, columnspan=2, padx=(4, 16))
+                continue
+            ghost_button(self.accounts, "Edit",
+                         lambda a=a: AccountDialog(self, self.db, self.app.refresh_all, a), width=60).grid(
+                row=i, column=1, padx=4)
+            ghost_button(self.accounts, "Remove", lambda a=a: self.remove_account(a), danger=True, width=70).grid(
+                row=i, column=2, padx=(4, 16))
+
+    def remove_account(self, acc):
+        ConfirmDialog(self, "Remove account?", f"{account_label(acc)} won't be offered at checkout any more. "
+                                               "Old bills and expenses keep its name.", "Remove",
+                      lambda: (self.db.remove_account(acc["id"]), self.app.refresh_all()))
 
     def remove(self, room):
         def do():

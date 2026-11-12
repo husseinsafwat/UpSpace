@@ -65,6 +65,23 @@ CREATE TABLE IF NOT EXISTS menu_items (
     active    INTEGER NOT NULL DEFAULT 1,
     position  INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS payment_accounts (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    method    TEXT NOT NULL CHECK (method IN ('cash', 'vodafone', 'instapay')),
+    number    TEXT,                  -- phone number / InstaPay address (empty for Cash)
+    active    INTEGER NOT NULL DEFAULT 1,
+    position  INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS payments (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind        TEXT NOT NULL CHECK (kind IN ('card', 'expense')),   -- money in (bill) / out (expense)
+    ref_id      INTEGER NOT NULL,                                    -- cards.id or expenses.id
+    account_id  INTEGER NOT NULL REFERENCES payment_accounts(id),
+    label       TEXT NOT NULL,                                       -- account name when paid
+    amount      REAL NOT NULL,
+    created_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_payments_ref ON payments(kind, ref_id);
 CREATE INDEX IF NOT EXISTS idx_cards_status ON cards(status);
 CREATE INDEX IF NOT EXISTS idx_cards_end ON cards(end_time);
 CREATE INDEX IF NOT EXISTS idx_expenses_created ON expenses(created_at);
@@ -114,6 +131,19 @@ def item_label(row) -> str:
     return f"{qty} × {name}" if qty > 1 or row["menu_item_id"] else name
 
 
+METHODS = {"cash": "Cash", "vodafone": "Vodafone Cash", "instapay": "InstaPay"}
+
+
+def account_label(acc) -> str:
+    """'Cash', 'Vodafone Cash · 01001234567'."""
+    name = METHODS[acc["method"]]
+    return f"{name} · {acc['number']}" if acc["number"] else name
+
+
+class PaymentError(Exception):
+    """Payment amounts don't match the bill / expense. The UI shows it in a popup."""
+
+
 class BookingError(Exception):
     """A rule was broken (room busy, not enough chairs, bad input...)."""
 
@@ -134,7 +164,12 @@ class Bill:
     effective_rate: float | None
     time_cost: float
     items_total: float
-    total: float
+    total: float          # rounded to the nearest pound
+    exact_total: float = 0.0
+
+    @property
+    def rounding(self) -> float:
+        return round(self.total - self.exact_total, 2)
 
 
 class Database:
@@ -145,6 +180,8 @@ class Database:
         self.conn.executescript(SCHEMA)
         self._migrate()
         self._seed_menu()
+        if self.conn.execute("SELECT COUNT(*) FROM payment_accounts WHERE method = 'cash'").fetchone()[0] == 0:
+            self.conn.execute("INSERT INTO payment_accounts (method, number, position) VALUES ('cash', NULL, 0)")
         self.conn.commit()
 
     def _migrate(self) -> None:
@@ -213,6 +250,157 @@ class Database:
         self.set_setting("hall_chairs", str(chairs), commit=False)
         self.set_setting("hall_tiers", pricing.tiers_to_text(clean), commit=False)
         self.conn.commit()
+
+    # -------------------------------------------------------- payment accounts
+    def list_accounts(self, active_only: bool = True):
+        sql = "SELECT * FROM payment_accounts"
+        if active_only:
+            sql += " WHERE active = 1"
+        return self.conn.execute(sql + " ORDER BY CASE method WHEN 'cash' THEN 0 WHEN 'vodafone' THEN 1 ELSE 2 END, "
+                                       "position, id").fetchall()
+
+    def cash_account_id(self) -> int:
+        return self.conn.execute("SELECT id FROM payment_accounts WHERE method = 'cash' ORDER BY id").fetchone()[0]
+
+    def _check_account(self, method: str, number: str, exclude_id=None) -> str:
+        if method not in ("vodafone", "instapay"):
+            raise BookingError("Choose Vodafone Cash or InstaPay.")
+        number = " ".join((number or "").split())
+        if not number:
+            raise BookingError("Enter the number (or InstaPay address).")
+        row = self.conn.execute("SELECT id FROM payment_accounts WHERE active = 1 AND method = ? "
+                                "AND lower(number) = lower(?) AND id IS NOT ?", (method, number, exclude_id)).fetchone()
+        if row:
+            raise BookingError(f"{METHODS[method]} {number} is already added.")
+        return number
+
+    def add_account(self, method: str, number: str) -> int:
+        number = self._check_account(method, number)
+        pos = self.conn.execute("SELECT COALESCE(MAX(position), 0) + 1 FROM payment_accounts").fetchone()[0]
+        cur = self.conn.execute("INSERT INTO payment_accounts (method, number, position) VALUES (?, ?, ?)",
+                                (method, number, pos))
+        self.conn.commit()
+        return cur.lastrowid
+
+    def update_account(self, account_id: int, method: str, number: str) -> None:
+        acc = self.get_account(account_id)
+        if acc is None or acc["method"] == "cash":
+            raise BookingError("Cash can't be edited.")
+        number = self._check_account(method, number, account_id)
+        self.conn.execute("UPDATE payment_accounts SET method = ?, number = ? WHERE id = ?", (method, number, account_id))
+        self.conn.commit()
+
+    def remove_account(self, account_id: int) -> None:
+        acc = self.get_account(account_id)
+        if acc is None or acc["method"] == "cash":
+            raise BookingError("Cash can't be removed.")
+        # Soft delete: old bills and expenses keep the account's name.
+        self.conn.execute("UPDATE payment_accounts SET active = 0 WHERE id = ?", (account_id,))
+        self.conn.commit()
+
+    def get_account(self, account_id: int):
+        return self.conn.execute("SELECT * FROM payment_accounts WHERE id = ?", (account_id,)).fetchone()
+
+    def _check_payments(self, payments, total: float, what: str) -> list[tuple]:
+        """payments: [(account_id, amount or None), ...].
+
+        One account → it takes the whole amount (its own amount may be left empty).
+        Two or more → every amount is required and they must add up exactly to the total.
+        Returns [(account_row, amount)]. Raises PaymentError with a message for the popup.
+        """
+        chosen = [(a, amt) for a, amt in (payments or []) if a is not None]
+        if not chosen:
+            raise PaymentError(f"Choose how the {what} was paid (Cash, Vodafone Cash or InstaPay).")
+        ids = [a for a, _ in chosen]
+        if len(set(ids)) != len(ids):
+            raise PaymentError("Each account can only be chosen once.")
+        rows = []
+        for account_id, _ in chosen:
+            acc = self.get_account(account_id)
+            if acc is None or not acc["active"]:
+                raise PaymentError("That payment account no longer exists. Choose another one.")
+            rows.append(acc)
+        total = round(float(total), 2)
+        if len(chosen) == 1:
+            return [(rows[0], total)]
+        out = []
+        for acc, (_, amount) in zip(rows, chosen):
+            if amount is None or (isinstance(amount, str) and not amount.strip()):
+                raise PaymentError(f"Enter the amount for {account_label(acc)}.")
+            try:
+                amount = round(float(str(amount).replace(",", "")), 2)
+            except ValueError:
+                raise PaymentError(f"The amount for {account_label(acc)} must be a number.")
+            if amount <= 0:
+                raise PaymentError(f"The amount for {account_label(acc)} must be more than 0.")
+            out.append((acc, amount))
+        paid = round(sum(a for _, a in out), 2)
+        if abs(paid - total) > 0.001:
+            diff = pricing.fmt_money(abs(paid - total))
+            more_less = f"{diff} more than" if paid > total else f"{diff} less than"
+            raise PaymentError(f"The payments add up to {pricing.fmt_money(paid)}, but the {what} is "
+                               f"{pricing.fmt_money(total)} ({more_less} it).\n"
+                               f"The amounts must add up exactly to {pricing.fmt_money(total)}.")
+        return out
+
+    def _save_payments(self, kind: str, ref_id: int, checked, when: str) -> None:
+        self.conn.execute("DELETE FROM payments WHERE kind = ? AND ref_id = ?", (kind, ref_id))
+        self.conn.executemany(
+            "INSERT INTO payments (kind, ref_id, account_id, label, amount, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            [(kind, ref_id, acc["id"], account_label(acc), amount, when) for acc, amount in checked])
+
+    def payments_for(self, kind: str, ref_id: int):
+        return self.conn.execute("SELECT * FROM payments WHERE kind = ? AND ref_id = ? ORDER BY id",
+                                 (kind, ref_id)).fetchall()
+
+    def account_totals(self, start: date, end: date) -> list[dict]:
+        """Per account: money in (bills closed), money out (expenses) and the balance, for the period.
+        Uses the bill's close time and the expense's time, like the Money page."""
+        lo, hi = self._range(start, end)
+        rows = self.conn.execute(
+            "SELECT p.account_id, p.kind, SUM(p.amount) AS amount FROM payments p "
+            "LEFT JOIN cards c ON p.kind = 'card' AND c.id = p.ref_id "
+            "LEFT JOIN expenses e ON p.kind = 'expense' AND e.id = p.ref_id "
+            "WHERE (p.kind = 'card' AND c.status = 'closed' AND c.end_time >= ? AND c.end_time < ?) "
+            "   OR (p.kind = 'expense' AND e.created_at >= ? AND e.created_at < ?) "
+            "GROUP BY p.account_id, p.kind", (lo, hi, lo, hi)).fetchall()
+        sums: dict[int, dict] = {}
+        for r in rows:
+            d = sums.setdefault(r["account_id"], {"in": 0.0, "out": 0.0})
+            d["in" if r["kind"] == "card" else "out"] += r["amount"]
+        out = []
+        for acc in self.list_accounts(active_only=False):
+            d = sums.get(acc["id"])
+            if d is None and not acc["active"]:
+                continue
+            d = d or {"in": 0.0, "out": 0.0}
+            out.append({"id": acc["id"], "label": account_label(acc), "method": acc["method"],
+                        "active": bool(acc["active"]), "in": round(d["in"], 2), "out": round(d["out"], 2),
+                        "balance": round(d["in"] - d["out"], 2)})
+        return out
+
+    def payment_stats(self, start: date, end: date) -> dict:
+        """For the report: per method money in/out and how many bills used it, plus mixed-payment bills."""
+        lo, hi = self._range(start, end)
+        bills = self.conn.execute(
+            "SELECT c.id, GROUP_CONCAT(DISTINCT a.method) AS methods, COUNT(p.id) AS n FROM cards c "
+            "LEFT JOIN payments p ON p.kind = 'card' AND p.ref_id = c.id "
+            "LEFT JOIN payment_accounts a ON a.id = p.account_id "
+            "WHERE c.status = 'closed' AND c.end_time >= ? AND c.end_time < ? GROUP BY c.id", (lo, hi)).fetchall()
+        methods = {m: {"label": name, "in": 0.0, "out": 0.0, "bills": 0} for m, name in METHODS.items()}
+        for acc in self.account_totals(start, end):
+            methods[acc["method"]]["in"] += acc["in"]
+            methods[acc["method"]]["out"] += acc["out"]
+        for b in bills:
+            for m in (b["methods"] or "").split(","):
+                if m:
+                    methods[m]["bills"] += 1
+        for m in methods.values():
+            m["in"], m["out"] = round(m["in"], 2), round(m["out"], 2)
+            m["balance"] = round(m["in"] - m["out"], 2)
+        return {"methods": methods, "bills": len(bills),
+                "mixed": sum(1 for b in bills if b["n"] > 1),
+                "not_recorded": sum(1 for b in bills if b["n"] == 0)}
 
     # ------------------------------------------------------------------- menu
     def list_menu(self, active_only: bool = True):
@@ -494,15 +682,19 @@ class Database:
             billed_hours = pricing.hall_billed_hours(minutes)
             time_cost = pricing.hall_time_cost(minutes, card["chairs"], tiers)
             rate = eff = pricing.hall_price_per_chair(billed_hours, tiers)
+        exact = round(time_cost + items_total, 2)
         return Bill(minutes, billed_hours, rate, eff, time_cost, round(items_total, 2),
-                    round(time_cost + items_total, 2))
+                    pricing.round_pound(exact), exact)
 
-    def close_card(self, card_id: int, end: datetime | None = None) -> Bill:
+    def close_card(self, card_id: int, end: datetime | None = None, payments=None) -> Bill:
+        """payments: [(account_id, amount or None), ...], see _check_payments. Required."""
         card = self.get_card(card_id)
         if card is None or card["status"] != "open":
             raise BookingError("This card is not open.")
         end = end or datetime.now()
         bill = self.compute_bill(card, end)
+        checked = self._check_payments(payments, bill.total, "bill")
+        self._save_payments("card", card_id, checked, now_str(end))
         self.conn.execute(
             "UPDATE cards SET status = 'closed', end_time = ?, minutes = ?, billed_hours = ?, "
             "time_cost = ?, items_total = ?, total = ? WHERE id = ?",
@@ -524,20 +716,28 @@ class Database:
             raise BookingError("Expense amount must be more than 0.")
         return description, amount
 
-    def add_expense(self, description: str, amount, when: datetime | None = None) -> int:
+    def add_expense(self, description: str, amount, when: datetime | None = None, payments=None) -> int:
+        """payments: which account(s) the money came from, same rules as a bill. Required."""
         description, amount = self._check_expense(description, amount)
+        checked = self._check_payments(payments, amount, "expense")
+        ts = now_str(when)
         cur = self.conn.execute("INSERT INTO expenses (description, amount, created_at) VALUES (?, ?, ?)",
-                                (description, amount, now_str(when)))
+                                (description, amount, ts))
+        self._save_payments("expense", cur.lastrowid, checked, ts)
         self.conn.commit()
         return cur.lastrowid
 
-    def update_expense(self, expense_id: int, description: str, amount) -> None:
+    def update_expense(self, expense_id: int, description: str, amount, payments=None) -> None:
         description, amount = self._check_expense(description, amount)
+        checked = self._check_payments(payments, amount, "expense")
+        row = self.conn.execute("SELECT created_at FROM expenses WHERE id = ?", (expense_id,)).fetchone()
         self.conn.execute("UPDATE expenses SET description = ?, amount = ? WHERE id = ?",
                           (description, amount, expense_id))
+        self._save_payments("expense", expense_id, checked, row["created_at"] if row else now_str())
         self.conn.commit()
 
     def delete_expense(self, expense_id: int) -> None:
+        self.conn.execute("DELETE FROM payments WHERE kind = 'expense' AND ref_id = ?", (expense_id,))
         self.conn.execute("DELETE FROM expenses WHERE id = ?", (expense_id,))
         self.conn.commit()
 
@@ -577,7 +777,10 @@ class Database:
             "expenses_total": round(sum(e["amount"] for e in expenses), 2),
             "cards": cards,
         }
-        s["income_total"] = round(s["room_time_income"] + s["hall_time_income"] + s["items_income"], 2)
+        # Bills are rounded to the pound; the difference is shown as its own line.
+        s["rounding"] = round(sum(c["total"] - c["time_cost"] - c["items_total"] for c in cards), 2)
+        s["income_total"] = round(sum(c["total"] for c in cards), 2)
+        s["accounts"] = self.account_totals(start, end)
         s["net"] = round(s["income_total"] - s["expenses_total"], 2)
         return s
 
