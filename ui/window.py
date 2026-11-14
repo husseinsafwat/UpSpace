@@ -12,6 +12,8 @@ from PySide6.QtWidgets import QButtonGroup, QFrame, QLabel, QLineEdit, QMainWind
 from config import LOGIN_EMAIL, LOGIN_PASSWORD_SHA256
 from db import Database
 
+from .customers import CustomersPage
+from .inventory import InventoryPage
 from .pages import HallPage, MenuPage, MoneyPage, RoomsPage, SettingsPage
 from .widgets import button, field, hbox, label, line_edit, panel, vbox
 
@@ -67,8 +69,8 @@ class LoginView(QWidget):
 
 
 class MainView(QWidget):
-    PAGES = (("Rooms", RoomsPage), ("Hall", HallPage), ("Menu", MenuPage), ("Money", MoneyPage),
-             ("Settings", SettingsPage))
+    PAGES = (("Rooms", RoomsPage), ("Hall", HallPage), ("Customers", CustomersPage), ("Menu", MenuPage),
+             ("Inventory", InventoryPage), ("Money", MoneyPage), ("Settings", SettingsPage))
 
     def __init__(self, db: Database, on_logout):
         super().__init__()
@@ -133,6 +135,11 @@ class MainView(QWidget):
         self.current = name
         self.nav[name].setChecked(True)
         self.stack.setCurrentWidget(page)
+
+    def open_restock(self, stock_item_id):
+        """From an out-of-stock popup: go to the Inventory page and open Restock for that item."""
+        self.show_page("Inventory")
+        self.pages["Inventory"].restock(stock_item_id)
 
     def data_changed(self):
         """Something was saved. Refresh the visible page now, the rest when they're opened."""

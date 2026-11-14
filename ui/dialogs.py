@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QComboBox, QDateEdit, QD
 
 import pricing
 from config import CURRENCY
-from db import SIZES, BookingError, Database, PaymentError, account_label, item_label
+from db import SIZES, BookingError, Database, OutOfStock, PaymentError, account_label, fmt_qty, item_label
 from pricing import fmt_duration, fmt_money
 
 from .widgets import (Table, button, caps, clear_layout, divider, field, hbox, label, line_edit, money, panel,
@@ -179,6 +179,24 @@ class MenuItemDialog(Dialog):
                 self.sized.setChecked(True)
                 for code, p in prices.items():
                     self.size_edits[code].setText(fmt_money(p).replace(",", ""))
+        self.body.addWidget(divider())
+        row = hbox(spacing=10)
+        self.stock = QComboBox()
+        self.stock.addItem("Not tracked (made fresh)", None)
+        for st in db.list_stock():
+            self.stock.addItem(f"{st['name']}  ·  {fmt_qty(st['quantity'])} {st['unit']} in stock", st["id"])
+        self.per_sale = line_edit("1", width=90)
+        self.per_sale.setAlignment(Qt.AlignCenter)
+        row.addWidget(field("Takes from inventory", self.stock), 1)
+        row.addWidget(field("Units per sale", self.per_sale))
+        self.body.addLayout(row)
+        self.body.addWidget(label("Each sale (any size) subtracts these units from the inventory item.", "Sub",
+                                  wrap=True))
+        if item and item["stock_item_id"] is not None:
+            self.stock.setCurrentIndex(max(0, self.stock.findData(item["stock_item_id"])))
+            self.per_sale.setText(fmt_qty(item["stock_per_sale"]))
+        self.stock.currentIndexChanged.connect(lambda _: self.per_sale.setEnabled(self.stock.currentData() is not None))
+        self.per_sale.setEnabled(self.stock.currentData() is not None)
         self.buttons("Save", self.save)
 
     def save(self):
@@ -188,9 +206,11 @@ class MenuItemDialog(Dialog):
             price, sizes = self.price.text(), None
         try:
             if self.item:
-                self.db.update_menu_item(self.item["id"], self.name.text(), self.cat.currentText(), price, sizes)
+                item_id = self.item["id"]
+                self.db.update_menu_item(item_id, self.name.text(), self.cat.currentText(), price, sizes)
             else:
-                self.db.add_menu_item(self.name.text(), self.cat.currentText(), price, sizes)
+                item_id = self.db.add_menu_item(self.name.text(), self.cat.currentText(), price, sizes)
+            self.db.set_menu_stock(item_id, self.stock.currentData(), self.per_sale.text() or 1)
         except BookingError as e:
             return self.show_error(str(e))
         self.accept()
@@ -458,6 +478,7 @@ class MenuPickerDialog(Dialog):
         self.cart: dict[tuple[int, str | None], int] = {}
         self.menu = {r["id"]: r for r in db.list_menu()}
         self.counts: dict[tuple[int, str | None], object] = {}
+        self.goto_stock = None          # set when the user chooses "Open Inventory" from an out-of-stock popup
 
         top = hbox(spacing=8)
         self.chips = QButtonGroup(self)
@@ -523,7 +544,13 @@ class MenuPickerDialog(Dialog):
                 self.list_lay.addWidget(head)
             row = QWidget()
             rl = hbox(row, margins=(0, 6, 0, 6), spacing=10)
-            rl.addWidget(label(m["name"], "H3"), 1)
+            names = vbox(spacing=0)
+            names.addWidget(label(m["name"], "H3"))
+            left = self.db.stock_left_for(m)
+            if left is not None:
+                names.addWidget(label(f"{fmt_qty(int(left + 1e-9))} left in stock" if left >= 1 else "Out of stock",
+                                      "Sub" if left >= 1 else "Bad"))
+            rl.addLayout(names, 1)
             for size, price in Database.item_prices(m).items():
                 rl.addWidget(self._counter(m["id"], size, price))
             self.list_lay.addWidget(row)
@@ -553,6 +580,14 @@ class MenuPickerDialog(Dialog):
 
     def change(self, item_id, size, delta):
         key = (item_id, size)
+        if delta > 0:
+            sid, per = self.db._menu_stock(self.menu[item_id])
+            if sid is not None:
+                used = sum(q * self.db._menu_stock(self.menu[i])[1] for (i, _), q in self.cart.items()
+                           if self.db._menu_stock(self.menu[i])[0] == sid)
+                st = self.db.get_stock_item(sid)
+                if used + per > st["quantity"] + 1e-9:
+                    return self.out_of_stock(OutOfStock(st, used + per, self.menu[item_id]["name"]))
         q = max(0, self.cart.get(key, 0) + delta)
         if q:
             self.cart[key] = q
@@ -604,6 +639,9 @@ class MenuPickerDialog(Dialog):
         def ok():
             try:
                 self.db.add_items(self.card["id"], [(i, s, q) for (i, s), q in self.cart.items()])
+            except OutOfStock as e:
+                d.reject()
+                return self.out_of_stock(e)
             except BookingError as e:
                 return d.show_error(str(e))
             d.accept()
@@ -611,6 +649,220 @@ class MenuPickerDialog(Dialog):
         d.buttons("Confirm", ok, cancel_text="Back")
         if d.exec() == QDialog.Accepted:
             self.accept()
+
+
+    def out_of_stock(self, err: OutOfStock):
+        if out_of_stock_popup(self, err):
+            self.goto_stock = err.stock_item["id"]
+            self.reject()
+
+
+def out_of_stock_popup(parent, err: OutOfStock) -> bool:
+    """Tell the user the item is out of stock. True = they want to open the Inventory to add quantity."""
+    d = Dialog(parent, "Out of stock", 440)
+    d.body.addWidget(label(str(err), wrap=True))
+    d.buttons("Open Inventory", d.accept, cancel_text="Close")
+    return d.exec() == QDialog.Accepted
+
+
+def name_mismatch_popup(parent, customer) -> bool:
+    """The phone belongs to someone else. True = use the registered name."""
+    d = Dialog(parent, "Phone already registered", 440)
+    d.body.addWidget(label(f"This phone ({customer['phone']}) is registered before with the name "
+                           f"“{customer['name']}”.", wrap=True))
+    d.body.addWidget(label("Names can only be changed in Customers.", "Sub", wrap=True))
+    d.buttons(f"Use “{customer['name']}”", d.accept, cancel_text="Cancel")
+    return d.exec() == QDialog.Accepted
+
+
+# ------------------------------------------------------------------------- customers & inventory
+class CustomerDialog(Dialog):
+    def __init__(self, parent, db: Database, customer=None):
+        super().__init__(parent, "Edit customer" if customer else "New customer", 460,
+                         "The phone number is unique: one customer per phone.")
+        self.db, self.customer = db, customer
+        self.phone = line_edit("e.g. 01001234567")
+        self.name = line_edit("Full name")
+        self.notes = line_edit("Optional (company, preferences…)")
+        self.body.addWidget(field("Phone", self.phone))
+        self.body.addWidget(field("Name", self.name))
+        self.body.addWidget(field("Notes", self.notes))
+        if customer:
+            self.phone.setText(customer["phone"])
+            self.name.setText(customer["name"])
+            self.notes.setText(customer["notes"] or "")
+        self.buttons("Save", self.save)
+
+    def save(self):
+        try:
+            if self.customer:
+                self.db.update_customer(self.customer["id"], self.name.text(), self.phone.text(), self.notes.text())
+            else:
+                self.db.add_customer(self.name.text(), self.phone.text(), self.notes.text())
+        except BookingError as e:
+            return self.show_error(str(e))
+        self.accept()
+
+
+class StockItemDialog(Dialog):
+    def __init__(self, parent, db: Database, item=None):
+        super().__init__(parent, "Edit inventory item" if item else "New inventory item", 480,
+                         "Things you keep in stock, like water bottles, cans or snacks.")
+        self.db, self.item = db, item
+        self.name = line_edit("e.g. Water bottle")
+        self.unit = line_edit("pcs", width=120)
+        self.qty = line_edit("0", width=120)
+        self.low = line_edit("5", width=120)
+        self.body.addWidget(field("Name", self.name))
+        row = hbox(spacing=12)
+        row.addWidget(field("Unit", self.unit))
+        if not item:
+            row.addWidget(field("Starting quantity", self.qty))
+        row.addWidget(field("Low-stock alert at", self.low))
+        row.addStretch(1)
+        self.body.addLayout(row)
+        if item:
+            self.name.setText(item["name"])
+            self.unit.setText(item["unit"])
+            self.low.setText(fmt_qty(item["low_level"]))
+            self.body.addWidget(label("To change the quantity use Restock or Adjust.", "Sub", wrap=True))
+        else:
+            self.low.setText("5")
+
+        # Selling it: a linked menu item is what shows in "+ Items" on the cards.
+        self.body.addWidget(divider())
+        sold = db.menu_items_for_stock(item["id"]) if item else []
+        self.sell = QCheckBox("Sell it on the menu (shows in “+ Items” on the cards)")
+        self.sell_box = QWidget()
+        if sold:
+            self.sell.setChecked(True)
+            self.sell.setEnabled(False)
+            self.body.addWidget(self.sell)
+            self.body.addWidget(label("Sold as: " + ", ".join(m["name"] for m in sold) +
+                                      ". Change its price in the Menu page.", "Sub", wrap=True))
+        else:
+            self.body.addWidget(self.sell)
+            sl = hbox(self.sell_box, spacing=12)
+            self.price = line_edit("e.g. 15", width=120)
+            self.cat = QComboBox()
+            self.cat.setEditable(True)
+            cats = db.menu_categories()
+            self.cat.addItems(cats)
+            self.cat.setCurrentText("Add-ons" if "Add-ons" in cats or not cats else cats[-1])
+            sl.addWidget(field("Category", self.cat), 1)
+            sl.addWidget(field(f"Price ({CURRENCY})", self.price))
+            self.body.addWidget(self.sell_box)
+            self.sell.toggled.connect(lambda on: (self.sell_box.setVisible(on), self.adjustSize()))
+            self.sell.setChecked(not item)
+            self.sell_box.setVisible(not item)
+        self.sold = bool(sold)
+        self.buttons("Save", self.save)
+
+    def save(self):
+        selling = self.sell.isChecked() and not self.sold
+        try:
+            if selling:          # check the menu part first, so nothing is half-saved
+                if self.db._money_or_none(self.price.text(), "Menu price") is None:
+                    raise BookingError("Enter the menu price, or untick “Sell it on the menu”.")
+                if not self.cat.currentText().strip():
+                    raise BookingError("Choose a menu category.")
+            if self.item:
+                self.db.update_stock_item(self.item["id"], self.name.text(), self.unit.text(), self.low.text())
+                stock_id = self.item["id"]
+            else:
+                stock_id = self.db.add_stock_item(self.name.text(), self.unit.text(), self.qty.text() or 0,
+                                                  self.low.text())
+            if selling:
+                self.db.sell_stock_item(stock_id, self.price.text(), self.cat.currentText())
+        except BookingError as e:
+            return self.show_error(str(e))
+        self.accept()
+
+
+class RestockDialog(Dialog):
+    def __init__(self, parent, db: Database, item):
+        super().__init__(parent, f"Restock · {item['name']}", 480,
+                         f"Now in stock: {fmt_qty(item['quantity'])} {item['unit']}.")
+        self.db, self.item = db, item
+        self.qty = line_edit(f"How many {item['unit']}")
+        self.note = line_edit("Optional (supplier, invoice…)")
+        self.body.addWidget(field("Quantity to add", self.qty))
+        self.body.addWidget(field("Note", self.note))
+        self.as_expense = QCheckBox("Also record the cost as an expense")
+        self.body.addWidget(self.as_expense)
+        self.cost_box = QWidget()
+        cl = vbox(self.cost_box, spacing=10)
+        self.cost = line_edit("e.g. 240")
+        cl.addWidget(field(f"Cost ({CURRENCY})", self.cost))
+        self.picker = PaymentPicker(db, lambda: parse_number(self.cost.text()))
+        cl.addWidget(field("Paid from (required)", self.picker))
+        self.cost.textEdited.connect(lambda _: self.picker.update_state())
+        self.cost_box.hide()
+        self.body.addWidget(self.cost_box)
+        self.as_expense.toggled.connect(self._toggle)
+        self.buttons("Add to stock", self.save)
+
+    def _toggle(self, on):
+        self.cost_box.setVisible(on)
+        self.adjustSize()
+
+    def save(self):
+        try:
+            if self.as_expense.isChecked():
+                cost = self.cost.text().strip()
+                if not cost:
+                    return self.show_error("Enter the cost, or untick “Also record the cost as an expense”.")
+                self.db.restock(self.item["id"], self.qty.text(), self.note.text(), cost, self.picker.get())
+            else:
+                self.db.restock(self.item["id"], self.qty.text(), self.note.text())
+        except PaymentError as e:
+            alert(self, "Payment doesn't match", str(e))
+            return
+        except BookingError as e:
+            return self.show_error(str(e))
+        self.accept()
+
+
+class AdjustStockDialog(Dialog):
+    """Take stock out (waste, broken, staff use) or set it to a counted number."""
+
+    def __init__(self, parent, db: Database, item):
+        super().__init__(parent, f"Adjust · {item['name']}", 460,
+                         f"Now in stock: {fmt_qty(item['quantity'])} {item['unit']}.")
+        self.db, self.item = db, item
+        chips = hbox(spacing=8)
+        self.mode = QButtonGroup(self)
+        for i, text in enumerate(("Take out", "Stock count")):
+            b = button(text, kind="Chip")
+            b.setCheckable(True)
+            b.setChecked(i == 0)
+            self.mode.addButton(b, i)
+            chips.addWidget(b)
+        chips.addStretch(1)
+        self.body.addLayout(chips)
+        self.qty = line_edit()
+        self.qty_field = field("Quantity to take out", self.qty)
+        self.note = line_edit("e.g. expired, broken, staff")
+        self.note_field = field("Reason (required)", self.note)
+        self.body.addWidget(self.qty_field)
+        self.body.addWidget(self.note_field)
+        self.mode.idClicked.connect(self._mode)
+        self.buttons("Save", self.save)
+
+    def _mode(self, i):
+        self.qty_field.layout().itemAt(0).widget().setText(("QUANTITY TO TAKE OUT", "COUNTED ON THE SHELF")[i])
+        self.note_field.layout().itemAt(0).widget().setText(("REASON (REQUIRED)", "NOTE")[i])
+        self.note.setPlaceholderText(("e.g. expired, broken, staff", "Optional")[i])
+
+    def save(self):
+        try:
+            if self.mode.checkedId() == 0:
+                self.db.take_out(self.item["id"], self.qty.text(), self.note.text())
+            else:
+                self.db.set_count(self.item["id"], self.qty.text(), self.note.text())
+        except BookingError as e:
+            return self.show_error(str(e))
+        self.accept()
 
 
 # ------------------------------------------------------------------------- report

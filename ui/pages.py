@@ -9,11 +9,11 @@ from PySide6.QtWidgets import (QComboBox, QDialog, QFrame, QGridLayout, QScrollA
 
 import pricing
 from config import CURRENCY
-from db import BookingError, Database, account_label, item_label
+from db import BookingError, Database, NameMismatch, account_label, fmt_qty, item_label
 from pricing import fmt_duration, fmt_money
 
 from .dialogs import (AccountDialog, CheckoutDialog, DiscountDialog, ExpenseDialog, MenuItemDialog,
-                      MenuPickerDialog, ReportDialog, RoomDialog, alert, confirm)
+                      MenuPickerDialog, ReportDialog, RoomDialog, alert, confirm, name_mismatch_popup)
 from .widgets import (Table, button, caps, divider, field, hbox, label, line_edit, money, panel,
                       vbox)
 
@@ -168,7 +168,10 @@ class CardWidget(QFrame):
             self.page.app.data_changed()
 
     def add_items(self):
-        self._done(MenuPickerDialog(self.window(), self.db, self.card))
+        picker = MenuPickerDialog(self.window(), self.db, self.card)
+        self._done(picker)
+        if picker.goto_stock is not None:          # "Open Inventory" from an out-of-stock popup
+            self.page.app.open_restock(picker.goto_stock)
 
     def discount(self):
         self._done(DiscountDialog(self.window(), self.db, self.card))
@@ -242,10 +245,14 @@ class BookingPage(Page):
         form.setFixedWidth(310)
         fl = vbox(form, margins=(22, 20, 22, 20), spacing=12)
         fl.addWidget(label(self.form_title, "H2"))
+        self.phone = line_edit("Required, e.g. 01001234567")
         self.name = line_edit("Required")
-        self.phone = line_edit("Optional")
-        fl.addWidget(field("Customer name", self.name))
         fl.addWidget(field("Phone", self.phone))
+        self.who = label("", "Sub", wrap=True)
+        self.who.hide()
+        fl.addWidget(self.who)
+        fl.addWidget(field("Customer name", self.name))
+        self.phone.textChanged.connect(self.lookup)
         self.build_extra(fl)
         self.error = label("", "Error", wrap=True)
         self.error.hide()
@@ -257,8 +264,8 @@ class BookingPage(Page):
         self.info = label("", "Sub", wrap=True)
         fl.addWidget(self.info)
         fl.addStretch(1)
-        self.name.returnPressed.connect(self.phone.setFocus)
-        self.phone.returnPressed.connect(self.start)
+        self.phone.returnPressed.connect(self.name.setFocus)
+        self.name.returnPressed.connect(self.start)
         row.addWidget(form)
 
         right = vbox(spacing=10)
@@ -274,8 +281,37 @@ class BookingPage(Page):
     def build_extra(self, layout):
         pass
 
-    def start(self):
+    def lookup(self, text):
+        """A known phone fills in the registered name; a new one says it will be saved."""
+        cust = self.db.find_customer(text)
+        if cust is not None:
+            st = self.db.customer_stats(cust["id"])
+            last = f" · last {st['last_visit'][:10]}" if st["last_visit"] else ""
+            self.name.setText(cust["name"])
+            self.who.setText(f"Returning customer · {st['visits']} visit(s){last}")
+            self.who.show()
+        elif sum(c.isdigit() for c in text) >= 8:
+            self.who.setText("New customer · will be saved with this phone")
+            self.who.show()
+        else:
+            self.who.hide()
+
+    def open_card(self):
         raise NotImplementedError
+
+    def start(self):
+        try:
+            self.open_card()
+        except NameMismatch as e:
+            if not name_mismatch_popup(self.window(), e.customer):
+                return
+            self.name.setText(e.customer["name"])
+            return self.start()
+        except BookingError as e:
+            self.fail(str(e))
+            return
+        self.reset_form()
+        self.app.data_changed()
 
     def fail(self, msg):
         self.error.setText(msg)
@@ -284,6 +320,7 @@ class BookingPage(Page):
     def reset_form(self):
         self.name.clear()
         self.phone.clear()
+        self.who.hide()
         self.error.hide()
 
     def refresh(self):
@@ -334,17 +371,11 @@ class RoomsPage(BookingPage):
             self.info.setText(f"{len(free)} free · {busy} busy out of {len(all_rooms)} room(s). "
                               "Busy rooms are hidden from the list until checkout.")
 
-    def start(self):
-        try:
-            room_id = self.room.currentData()
-            if room_id is None:
-                raise BookingError("Please choose a free room.")
-            self.db.open_room_card(self.name.text(), self.phone.text(), room_id)
-        except BookingError as e:
-            self.fail(str(e))
-            return
-        self.reset_form()
-        self.app.data_changed()
+    def open_card(self):
+        room_id = self.room.currentData()
+        if room_id is None:
+            raise BookingError("Please choose a free room.")
+        self.db.open_room_card(self.name.text(), self.phone.text(), room_id)
 
 
 class HallPage(BookingPage):
@@ -393,14 +424,8 @@ class HallPage(BookingPage):
         super().reset_form()
         self.chairs.setText("1")
 
-    def start(self):
-        try:
-            self.db.open_hall_card(self.name.text(), self.phone.text(), self.chairs.text())
-        except BookingError as e:
-            self.fail(str(e))
-            return
-        self.reset_form()
-        self.app.data_changed()
+    def open_card(self):
+        self.db.open_hall_card(self.name.text(), self.phone.text(), self.chairs.text())
 
 
 # ============================================================================ menu
@@ -411,31 +436,35 @@ class MenuPage(Page):
         self.toolbar.addWidget(button("+ New item", lambda: self.edit(None), "Primary"))
         box = panel()
         bl = vbox(box, margins=(6, 6, 6, 6))
-        self.table = Table(["Item", "Category", "Price", ""], money_cols=(2,), stretch=0, row_height=44)
+        self.table = Table(["Item", "Category", "Inventory", "Price", ""], money_cols=(3,), stretch=0, row_height=44)
         bl.addWidget(self.table)
         self.body.addWidget(box, 1)
         self._key = None
 
     def refresh(self):
         items = self.db.list_menu()
-        key = [tuple(r) for r in items]
+        stock = {st["id"]: st for st in self.db.list_stock()}
+        key = ([tuple(r) for r in items], [tuple(r) for r in stock.values()])
         if key == self._key:
             return
         self._key = key
         rows = []
         for it in items:
+            st = stock.get(it["stock_item_id"])
+            per = f"{fmt_qty(it['stock_per_sale'])} × " if st and it["stock_per_sale"] != 1 else ""
+            inv = f"{per}{st['name']}  ·  {fmt_qty(st['quantity'])} left" if st else "—"
             prices = Database.item_prices(it)
             if None in prices:
                 price = money(prices[None])
             else:
                 price = "  ·  ".join(f"{s} {fmt_money(p)}" for s, p in prices.items()) + f" {CURRENCY}"
-            rows.append([it["name"], it["category"], price,
+            rows.append([it["name"], it["category"], inv, price,
                          actions(small("Edit", lambda _=False, i=it: self.edit(i)),
                                  small("Remove", lambda _=False, i=it: self.remove(i), danger=True))])
         self.table.set_rows(rows)
         if not items:
             self.table.setRowCount(1)
-            self.table.setSpan(0, 0, 1, 4)
+            self.table.setSpan(0, 0, 1, 5)
             self.table.set_rows([["The menu is empty. Click “+ New item” to add one."]])
 
     def edit(self, item):

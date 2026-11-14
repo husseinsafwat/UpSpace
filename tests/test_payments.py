@@ -26,7 +26,7 @@ class Payments(unittest.TestCase):
         self.start = datetime.now().replace(hour=10, minute=0, second=0, microsecond=0)
 
     def card(self):
-        return self.db.open_room_card("Ali", "", self.room, when=self.start)
+        return self.db.open_room_card("Ali", "01000000001", self.room, when=self.start)
 
     def close(self, cid, payments):
         return self.db.close_card(cid, end=self.start + timedelta(minutes=100), payments=payments)
@@ -89,7 +89,7 @@ class Payments(unittest.TestCase):
 
     def test_rounding_in_summary(self):
         room = self.db.add_room("B", 100)
-        cid = self.db.open_room_card("S", "", room, when=self.start)
+        cid = self.db.open_room_card("S", "01000000007", room, when=self.start)
         bill = self.db.close_card(cid, end=self.start + timedelta(minutes=95), payments=[(self.cash, None)])
         self.assertEqual((bill.exact_total, bill.total, bill.rounding), (158.33, 158, -0.33))
         s = self.db.summary(self.start.date(), self.start.date())

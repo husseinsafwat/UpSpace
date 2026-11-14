@@ -2,7 +2,7 @@
 Unicode true
 !define APPNAME "UpSpace"
 !ifndef APPVER
-  !define APPVER "2.0"
+  !define APPVER "2.1"
 !endif
 Name "${APPNAME} Bookings & Billing"
 OutFile "..\dist\UpSpace-Setup.exe"

@@ -20,10 +20,10 @@ class Report(unittest.TestCase):
         self.d1 = date.today() - timedelta(days=2)
         self.d3 = date.today()
         t1 = datetime.combine(self.d1, datetime.min.time()).replace(hour=10)
-        c = self.db.open_room_card("Ali", "", self.room, when=t1)
+        c = self.db.open_room_card("Ali", "01000000001", self.room, when=t1)
         self.db.add_items(c, [(self.menu["Latte"], "M", 2), (self.menu["Flavor"], None, 1)])
         self.db.close_card(c, end=t1 + timedelta(minutes=90), payments=[(self.db.cash_account_id(), None)])                 # 180 + 145
-        h = self.db.open_hall_card("G", "", 3, when=t1)
+        h = self.db.open_hall_card("G", "01000000006", 3, when=t1)
         self.db.add_items(h, [(self.menu["Latte"], "M", 1)])
         self.db.close_card(h, end=t1 + timedelta(minutes=160), payments=[(self.db.cash_account_id(), None)])                # 120 + 65
         self.db.add_expense("Milk", 70, when=t1 + timedelta(hours=1), payments=[(self.db.cash_account_id(), None)])

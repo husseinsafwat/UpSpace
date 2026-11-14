@@ -1,6 +1,7 @@
-"""SQLite storage for rooms, cards (bookings), items, the drinks menu, settings and expenses."""
+"""SQLite storage for rooms, cards (bookings), items, the drinks menu, customers, inventory, settings and expenses."""
 from __future__ import annotations
 
+import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -81,6 +82,34 @@ CREATE TABLE IF NOT EXISTS payments (
     amount      REAL NOT NULL,
     created_at  TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS customers (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    phone       TEXT NOT NULL UNIQUE,              -- digits only; the customer's key
+    name        TEXT NOT NULL,
+    notes       TEXT,
+    created_at  TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS stock_items (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL,
+    unit        TEXT NOT NULL DEFAULT 'pcs',
+    quantity    REAL NOT NULL DEFAULT 0,
+    low_level   REAL NOT NULL DEFAULT 5,           -- warn when the stock is at or below this
+    active      INTEGER NOT NULL DEFAULT 1,
+    created_at  TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS stock_moves (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    stock_item_id INTEGER NOT NULL REFERENCES stock_items(id),
+    change        REAL NOT NULL,                   -- + in, - out
+    reason        TEXT NOT NULL CHECK (reason IN ('start', 'restock', 'sale', 'return', 'take_out', 'count')),
+    note          TEXT,
+    card_id       INTEGER,
+    expense_id    INTEGER,
+    balance       REAL NOT NULL,                   -- stock after this move
+    created_at    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_stock_moves_item ON stock_moves(stock_item_id, id);
 CREATE INDEX IF NOT EXISTS idx_payments_ref ON payments(kind, ref_id);
 CREATE INDEX IF NOT EXISTS idx_cards_status ON cards(status);
 CREATE INDEX IF NOT EXISTS idx_cards_end ON cards(end_time);
@@ -90,11 +119,16 @@ CREATE INDEX IF NOT EXISTS idx_expenses_created ON expenses(created_at);
 
 # Columns added after v1.1. Old databases get them on start-up (ALTER TABLE ... ADD COLUMN).
 MIGRATIONS = {
-    "cards": [("hall_tiers", "TEXT")],                 # hall prices copied onto the card at start
+    "cards": [("hall_tiers", "TEXT"),                  # hall prices copied onto the card at start
+              ("customer_id", "INTEGER")],             # v2.1: link to customers (by phone)
     "items": [("qty", "INTEGER NOT NULL DEFAULT 1"),   # price = qty x unit_price (line total)
               ("size", "TEXT"),
               ("unit_price", "REAL"),
-              ("menu_item_id", "INTEGER")],
+              ("menu_item_id", "INTEGER"),
+              ("stock_item_id", "INTEGER"),          # v2.1: stock taken for this line (given back on remove)
+              ("stock_qty", "REAL")],
+    "menu_items": [("stock_item_id", "INTEGER"),       # v2.1: inventory item used by one sale
+                   ("stock_per_sale", "REAL NOT NULL DEFAULT 1")],
 }
 
 SIZES = (("S", "Small", "price_s"), ("M", "Medium", "price_m"), ("L", "Large", "price_l"))
@@ -148,6 +182,45 @@ class BookingError(Exception):
     """A rule was broken (room busy, not enough chairs, bad input...)."""
 
 
+class NameMismatch(BookingError):
+    """The phone is already registered under another name. The UI offers to use the registered name."""
+
+    def __init__(self, customer):
+        self.customer = customer
+        super().__init__(f"This phone ({customer['phone']}) is already registered with the name "
+                         f"\"{customer['name']}\".")
+
+
+class OutOfStock(BookingError):
+    """Not enough of an inventory item for the items being added. The UI offers to open the Inventory."""
+
+    def __init__(self, stock_item, needed: float, menu_name: str):
+        self.stock_item, self.needed, self.menu_name = stock_item, needed, menu_name
+        have = fmt_qty(stock_item["quantity"])
+        super().__init__(f"\"{menu_name}\" is out of stock. It needs {fmt_qty(needed)} {stock_item['unit']} of "
+                         f"\"{stock_item['name']}\", and only {have} {stock_item['unit']} left.\n"
+                         "Add quantity to it in the Inventory page first.")
+
+
+def fmt_qty(q) -> str:
+    q = float(q or 0)
+    return str(int(q)) if q == int(q) else f"{q:g}"
+
+
+def normalize_phone(phone) -> str:
+    """Keep the digits only ('0100 123-4567' → '01001234567'). Raises BookingError if it isn't a phone."""
+    digits = re.sub(r"\D", "", str(phone or ""))
+    if not digits:
+        raise BookingError("Phone number is required.")
+    if not 8 <= len(digits) <= 15:
+        raise BookingError("Phone number must have 8 to 15 digits.")
+    return digits
+
+
+STOCK_REASONS = {"start": "Opening stock", "restock": "Restock", "sale": "Sold on a card", "return": "Returned",
+                 "take_out": "Taken out", "count": "Stock count"}
+
+
 def now_str(dt: datetime | None = None) -> str:
     return (dt or datetime.now()).strftime(TS)
 
@@ -180,6 +253,7 @@ class Database:
         self.conn.executescript(SCHEMA)
         self._migrate()
         self._seed_menu()
+        self._import_customers()
         if self.conn.execute("SELECT COUNT(*) FROM payment_accounts WHERE method = 'cash'").fetchone()[0] == 0:
             self.conn.execute("INSERT INTO payment_accounts (method, number, position) VALUES ('cash', NULL, 0)")
         self.conn.commit()
@@ -207,6 +281,26 @@ class Database:
                         (name, category, None if sized else price, *(
                             (price.get(c) if sized else None) for c, _, _ in SIZES), pos))
         self.set_setting("menu_seeded", "1", commit=False)
+
+    def _import_customers(self) -> None:
+        """v2.1: create customers from old cards that have a phone (newest name wins) and link the cards."""
+        rows = self.conn.execute("SELECT id, customer_name, phone, start_time FROM cards "
+                                 "WHERE customer_id IS NULL AND phone IS NOT NULL AND phone != '' "
+                                 "ORDER BY start_time DESC, id DESC").fetchall()
+        for r in rows:
+            try:
+                phone = normalize_phone(r["phone"])
+            except BookingError:
+                continue
+            cust = self.find_customer(phone)
+            if cust is None:
+                cid = self.conn.execute("INSERT INTO customers (phone, name, created_at) VALUES (?, ?, ?)",
+                                        (phone, r["customer_name"].strip(), r["start_time"])).lastrowid
+            else:
+                cid = cust["id"]
+                if r["start_time"] < cust["created_at"]:
+                    self.conn.execute("UPDATE customers SET created_at = ? WHERE id = ?", (r["start_time"], cid))
+            self.conn.execute("UPDATE cards SET customer_id = ? WHERE id = ?", (cid, r["id"]))
 
     # --------------------------------------------------------------- settings
     def get_setting(self, key: str, default: str | None = None) -> str | None:
@@ -471,6 +565,24 @@ class Database:
                           "price_l = ? WHERE id = ?", (*values, item_id))
         self.conn.commit()
 
+    def set_menu_stock(self, item_id: int, stock_item_id, per_sale=1) -> None:
+        """Link a menu item to an inventory item (None = not tracked, e.g. drinks made fresh)."""
+        if stock_item_id is not None:
+            st = self.get_stock_item(stock_item_id)
+            if st is None or not st["active"]:
+                raise BookingError("Choose an inventory item.")
+            try:
+                per_sale = float(str(per_sale).replace(",", ""))
+            except (TypeError, ValueError):
+                raise BookingError("Units per sale must be a number.")
+            if per_sale <= 0:
+                raise BookingError("Units per sale must be more than 0.")
+        else:
+            per_sale = 1
+        self.conn.execute("UPDATE menu_items SET stock_item_id = ?, stock_per_sale = ? WHERE id = ?",
+                          (stock_item_id, per_sale, item_id))
+        self.conn.commit()
+
     def remove_menu_item(self, item_id: int) -> None:
         # Soft delete: bills already made keep the item's name and price.
         self.conn.execute("UPDATE menu_items SET active = 0 WHERE id = ?", (item_id,))
@@ -544,14 +656,34 @@ class Database:
         return self.hall_chairs_total() - self.chairs_in_use()
 
     @staticmethod
-    def _check_customer(name: str) -> str:
-        name = (name or "").strip()
+    def _check_name(name: str) -> str:
+        name = " ".join((name or "").split())
         if not name:
             raise BookingError("Customer name is required.")
         return name
 
+    def _booking_customer(self, name: str, phone: str, when: datetime | None):
+        """The customer for a new card. A new phone registers a new customer; a known phone must come
+        with its registered name (NameMismatch otherwise; names are changed only in the Customers tab)."""
+        name = self._check_name(name)
+        phone = normalize_phone(phone)
+        cust = self.find_customer(phone)
+        if cust is None:
+            return None, name, phone
+        if cust["name"].casefold() != name.casefold():
+            raise NameMismatch(cust)
+        return cust, cust["name"], phone
+
+    def _link_customer(self, card_id: int, cust, name: str, phone: str, when: str) -> None:
+        if cust is None:
+            cid = self.conn.execute("INSERT INTO customers (phone, name, created_at) VALUES (?, ?, ?)",
+                                    (phone, name, when)).lastrowid
+        else:
+            cid = cust["id"]
+        self.conn.execute("UPDATE cards SET customer_id = ? WHERE id = ?", (cid, card_id))
+
     def open_room_card(self, customer: str, phone: str, room_id: int, when: datetime | None = None) -> int:
-        customer = self._check_customer(customer)
+        cust, customer, phone = self._booking_customer(customer, phone, when)
         room = self.conn.execute("SELECT * FROM rooms WHERE id = ? AND active = 1", (room_id,)).fetchone()
         if room is None:
             raise BookingError("Please choose a room.")
@@ -560,12 +692,13 @@ class Database:
         cur = self.conn.execute(
             "INSERT INTO cards (kind, customer_name, phone, room_id, room_name, rate, start_time) "
             "VALUES ('room', ?, ?, ?, ?, ?, ?)",
-            (customer, (phone or "").strip() or None, room_id, room["name"], room["price_per_hour"], now_str(when)))
+            (customer, phone, room_id, room["name"], room["price_per_hour"], now_str(when)))
+        self._link_customer(cur.lastrowid, cust, customer, phone, now_str(when))
         self.conn.commit()
         return cur.lastrowid
 
     def open_hall_card(self, customer: str, phone: str, chairs, when: datetime | None = None) -> int:
-        customer = self._check_customer(customer)
+        cust, customer, phone = self._booking_customer(customer, phone, when)
         try:
             chairs = int(chairs)
         except (TypeError, ValueError):
@@ -578,8 +711,8 @@ class Database:
         cur = self.conn.execute(
             "INSERT INTO cards (kind, customer_name, phone, chairs, hall_tiers, start_time) "
             "VALUES ('hall', ?, ?, ?, ?, ?)",
-            (customer, (phone or "").strip() or None, chairs, pricing.tiers_to_text(self.hall_tiers()),
-             now_str(when)))
+            (customer, phone, chairs, pricing.tiers_to_text(self.hall_tiers()), now_str(when)))
+        self._link_customer(cur.lastrowid, cust, customer, phone, now_str(when))
         self.conn.commit()
         return cur.lastrowid
 
@@ -613,7 +746,12 @@ class Database:
         self.conn.commit()
 
     def cancel_card(self, card_id: int) -> None:
-        """Remove a booking made by mistake. It is not billed or counted."""
+        """Remove a booking made by mistake. It is not billed or counted; its items go back to stock."""
+        card = self.get_card(card_id)
+        if card is None or card["status"] != "open":
+            return
+        for it in self.card_items(card_id):
+            self._return_stock(it, card_id)
         self.conn.execute("UPDATE cards SET status = 'cancelled', end_time = ? WHERE id = ? AND status = 'open'",
                           (now_str(), card_id))
         self.conn.commit()
@@ -632,7 +770,7 @@ class Database:
         card = self.get_card(card_id)
         if card is None or card["status"] != "open":
             raise BookingError("This card is not open.")
-        rows = []
+        rows, need, names = [], {}, {}
         for menu_item_id, size, qty in lines:
             try:
                 qty = int(qty)
@@ -647,15 +785,49 @@ class Database:
             if size not in prices:
                 raise BookingError(f'Choose a size for "{item["name"]}".')
             unit = prices[size]
-            rows.append((card_id, item["name"], round(unit * qty, 2), now_str(), qty, size, unit, item["id"]))
+            stock_id, stock_qty = self._menu_stock(item)
+            if stock_id is not None:
+                stock_qty *= qty
+                need[stock_id] = need.get(stock_id, 0) + stock_qty
+                names.setdefault(stock_id, item["name"])
+            rows.append((card_id, item["name"], round(unit * qty, 2), now_str(), qty, size, unit, item["id"],
+                         stock_id, stock_qty if stock_id is not None else None))
         if not rows:
             raise BookingError("Nothing to add. Use + to put items in the cart.")
-        self.conn.executemany(
-            "INSERT INTO items (card_id, name, price, created_at, qty, size, unit_price, menu_item_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)", rows)
+        for stock_id, amount in need.items():          # all or nothing: check every stock item first
+            st = self.get_stock_item(stock_id)
+            if st["quantity"] + 1e-9 < amount:
+                raise OutOfStock(st, amount, names[stock_id])
+        for r in rows:
+            self.conn.execute(
+                "INSERT INTO items (card_id, name, price, created_at, qty, size, unit_price, menu_item_id, "
+                "stock_item_id, stock_qty) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", r)
+            if r[8] is not None:
+                self._move(r[8], -r[9], "sale", f"{r[4]} × {r[1]}" + (f" ({r[5]})" if r[5] else ""), card_id=card_id)
         self.conn.commit()
 
+    def _menu_stock(self, item):
+        """(stock_item_id, units per sale) for a menu item linked to an active inventory item, else (None, 0)."""
+        sid = item["stock_item_id"]
+        if sid is None:
+            return None, 0
+        st = self.get_stock_item(sid)
+        if st is None or not st["active"]:
+            return None, 0
+        return sid, float(item["stock_per_sale"] or 1)
+
+    def _return_stock(self, item_row, card_id) -> None:
+        if item_row["stock_item_id"] is not None and item_row["stock_qty"]:
+            st = self.get_stock_item(item_row["stock_item_id"])
+            if st is not None:
+                self._move(st["id"], item_row["stock_qty"], "return", item_label(item_row), card_id=card_id)
+
     def delete_item(self, item_id: int) -> None:
+        """Take an item off an open card; its stock goes back to the inventory."""
+        row = self.conn.execute("SELECT * FROM items WHERE id = ?", (item_id,)).fetchone()
+        if row is None:
+            return
+        self._return_stock(row, row["card_id"])
         self.conn.execute("DELETE FROM items WHERE id = ?", (item_id,))
         self.conn.commit()
 
@@ -819,3 +991,257 @@ class Database:
     def running_estimate(self) -> tuple[int, float]:
         open_cards = self.open_cards()
         return len(open_cards), round(sum(self.compute_bill(c).total for c in open_cards), 2)
+
+    # -------------------------------------------------------------- customers
+    def find_customer(self, phone):
+        try:
+            phone = normalize_phone(phone)
+        except BookingError:
+            return None
+        return self.conn.execute("SELECT * FROM customers WHERE phone = ?", (phone,)).fetchone()
+
+    def get_customer(self, customer_id: int):
+        return self.conn.execute("SELECT * FROM customers WHERE id = ?", (customer_id,)).fetchone()
+
+    def _check_customer_input(self, name, phone, exclude_id=None):
+        name = self._check_name(name)
+        phone = normalize_phone(phone)
+        other = self.find_customer(phone)
+        if other is not None and other["id"] != exclude_id:
+            raise BookingError(f"This phone ({phone}) is already registered with the name \"{other['name']}\".")
+        return name, phone
+
+    def add_customer(self, name, phone, notes: str = "") -> int:
+        name, phone = self._check_customer_input(name, phone)
+        cur = self.conn.execute("INSERT INTO customers (phone, name, notes, created_at) VALUES (?, ?, ?, ?)",
+                                (phone, name, (notes or "").strip() or None, now_str()))
+        self.conn.commit()
+        return cur.lastrowid
+
+    def update_customer(self, customer_id: int, name, phone, notes: str = "") -> None:
+        """Change a customer's name/phone (only from the Customers tab). Their open cards show the new name."""
+        name, phone = self._check_customer_input(name, phone, exclude_id=customer_id)
+        self.conn.execute("UPDATE customers SET name = ?, phone = ?, notes = ? WHERE id = ?",
+                          (name, phone, (notes or "").strip() or None, customer_id))
+        self.conn.execute("UPDATE cards SET customer_name = ?, phone = ? WHERE customer_id = ? AND status = 'open'",
+                          (name, phone, customer_id))
+        self.conn.commit()
+
+    def remove_customer(self, customer_id: int) -> None:
+        n = self.conn.execute("SELECT COUNT(*) FROM cards WHERE customer_id = ? AND status != 'cancelled'",
+                              (customer_id,)).fetchone()[0]
+        if n:
+            raise BookingError("This customer has bookings, so they're kept for the statistics.")
+        self.conn.execute("UPDATE cards SET customer_id = NULL WHERE customer_id = ?", (customer_id,))
+        self.conn.execute("DELETE FROM customers WHERE id = ?", (customer_id,))
+        self.conn.commit()
+
+    def list_customers(self, search: str = ""):
+        """Every customer with their lifetime numbers (closed bills only), most recent visit first."""
+        q = f"%{(search or '').strip()}%"
+        digits = re.sub(r"\D", "", search or "")
+        return self.conn.execute(
+            "SELECT cu.*, COUNT(c.id) AS visits, COALESCE(SUM(c.total), 0) AS spent, MAX(c.end_time) AS last_visit, "
+            "(SELECT COUNT(*) FROM cards o WHERE o.customer_id = cu.id AND o.status = 'open') AS open_cards "
+            "FROM customers cu LEFT JOIN cards c ON c.customer_id = cu.id AND c.status = 'closed' "
+            "WHERE cu.name LIKE ? OR (? != '' AND cu.phone LIKE ?) "
+            "GROUP BY cu.id ORDER BY COALESCE(MAX(c.end_time), cu.created_at) DESC",
+            (q, digits, f"%{digits}%")).fetchall()
+
+    def _cust_where(self, customer_id, start, end):
+        sql, args = "c.status = 'closed' AND c.customer_id IS NOT NULL", []
+        if customer_id is not None:
+            sql += " AND c.customer_id = ?"
+            args.append(customer_id)
+        if start is not None:
+            lo, hi = self._range(start, end or date.today())
+            sql += " AND c.end_time >= ? AND c.end_time < ?"
+            args += [lo, hi]
+        return sql, args
+
+    def customer_stats(self, customer_id=None, start: date | None = None, end: date | None = None) -> dict:
+        """Numbers for one customer (or all customers) over a period (None = the whole life of the app)."""
+        where, args = self._cust_where(customer_id, start, end)
+        cards = self.conn.execute(f"SELECT c.* FROM cards c WHERE {where} ORDER BY c.end_time DESC", args).fetchall()
+        rooms = [c for c in cards if c["kind"] == "room"]
+        halls = [c for c in cards if c["kind"] == "hall"]
+        total = round(sum(c["total"] for c in cards), 2)
+        items = self.conn.execute(
+            "SELECT i.name, i.size, SUM(COALESCE(i.qty, 1)) AS qty, SUM(i.price) AS total FROM items i "
+            f"JOIN cards c ON c.id = i.card_id WHERE {where} "
+            "GROUP BY i.name, COALESCE(i.size, '') ORDER BY qty DESC, total DESC, i.name", args).fetchall()
+        return {
+            "cards": cards,
+            "visits": len(cards),
+            "room_visits": len(rooms),
+            "hall_visits": len(halls),
+            "minutes": sum(c["minutes"] or 0 for c in cards),
+            "room_minutes": sum(c["minutes"] or 0 for c in rooms),
+            "hall_minutes": sum(c["minutes"] or 0 for c in halls),
+            "hall_chair_hours": sum((c["chairs"] or 0) * (c["billed_hours"] or 0) for c in halls),
+            "time_spent": round(sum(c["time_cost"] or 0 for c in cards), 2),
+            "items_spent": round(sum(c["items_total"] or 0 for c in cards), 2),
+            "items_count": int(sum(i["qty"] for i in items)),
+            "total": total,
+            "average": round(total / len(cards), 2) if cards else 0.0,
+            "first_visit": min((c["start_time"] for c in cards), default=None),
+            "last_visit": max((c["end_time"] for c in cards), default=None),
+            "items": items,
+            "customers": len({c["customer_id"] for c in cards}),
+        }
+
+    def top_customers(self, start: date | None = None, end: date | None = None, limit: int | None = None):
+        """Customers ranked by money spent in the period."""
+        where, args = self._cust_where(None, start, end)
+        sql = ("SELECT cu.id, cu.name, cu.phone, COUNT(c.id) AS visits, SUM(c.minutes) AS minutes, "
+               "SUM(c.items_total) AS items_spent, SUM(c.total) AS total, MAX(c.end_time) AS last_visit, "
+               "(SELECT COALESCE(SUM(COALESCE(i.qty, 1)), 0) FROM items i JOIN cards c2 ON c2.id = i.card_id "
+               f" WHERE c2.customer_id = cu.id AND {where.replace('c.', 'c2.')}) AS items_count "
+               f"FROM cards c JOIN customers cu ON cu.id = c.customer_id WHERE {where} "
+               "GROUP BY cu.id ORDER BY total DESC, visits DESC, cu.name")
+        if limit:
+            sql += f" LIMIT {int(limit)}"
+        return self.conn.execute(sql, args + args).fetchall()
+
+    def card_items_text(self, card_id: int) -> str:
+        return ", ".join(item_label(i) for i in self.card_items(card_id))
+
+    # -------------------------------------------------------------- inventory
+    def list_stock(self, active_only: bool = True):
+        sql = "SELECT * FROM stock_items"
+        if active_only:
+            sql += " WHERE active = 1"
+        return self.conn.execute(sql + " ORDER BY name COLLATE NOCASE").fetchall()
+
+    def get_stock_item(self, stock_item_id):
+        if stock_item_id is None:
+            return None
+        return self.conn.execute("SELECT * FROM stock_items WHERE id = ?", (stock_item_id,)).fetchone()
+
+    @staticmethod
+    def _qty(value, label: str, allow_zero: bool = False) -> float:
+        try:
+            value = float(str(value if value is not None else "").replace(",", "") or "x")
+        except ValueError:
+            raise BookingError(f"{label} must be a number.")
+        if value < 0 or (value == 0 and not allow_zero):
+            raise BookingError(f"{label} must be more than 0." if not allow_zero else f"{label} can't be negative.")
+        return value
+
+    def _check_stock_input(self, name, unit, low_level, exclude_id=None):
+        name = " ".join((name or "").split())
+        if not name:
+            raise BookingError("Item name is required.")
+        unit = " ".join((unit or "").split()) or "pcs"
+        low = self._qty(low_level, "Low-stock alert", allow_zero=True)
+        row = self.conn.execute("SELECT id FROM stock_items WHERE active = 1 AND lower(name) = lower(?) AND id IS NOT ?",
+                                (name, exclude_id)).fetchone()
+        if row:
+            raise BookingError(f'"{name}" is already in the inventory.')
+        return name, unit, low
+
+    def add_stock_item(self, name, unit="pcs", quantity=0, low_level=5) -> int:
+        name, unit, low = self._check_stock_input(name, unit, low_level)
+        qty = self._qty(quantity, "Starting quantity", allow_zero=True)
+        cur = self.conn.execute("INSERT INTO stock_items (name, unit, quantity, low_level, created_at) "
+                                "VALUES (?, ?, 0, ?, ?)", (name, unit, low, now_str()))
+        if qty:
+            self._move(cur.lastrowid, qty, "start")
+        self.conn.commit()
+        return cur.lastrowid
+
+    def update_stock_item(self, stock_item_id: int, name, unit, low_level) -> None:
+        name, unit, low = self._check_stock_input(name, unit, low_level, exclude_id=stock_item_id)
+        self.conn.execute("UPDATE stock_items SET name = ?, unit = ?, low_level = ? WHERE id = ?",
+                          (name, unit, low, stock_item_id))
+        self.conn.commit()
+
+    def remove_stock_item(self, stock_item_id: int) -> None:
+        """Soft delete; menu items linked to it stop being tracked."""
+        self.conn.execute("UPDATE stock_items SET active = 0 WHERE id = ?", (stock_item_id,))
+        self.conn.execute("UPDATE menu_items SET stock_item_id = NULL WHERE stock_item_id = ?", (stock_item_id,))
+        self.conn.commit()
+
+    def _move(self, stock_item_id: int, change: float, reason: str, note: str | None = None, card_id=None,
+              expense_id=None, when: datetime | None = None) -> None:
+        """Change the stock and log it (no commit)."""
+        st = self.get_stock_item(stock_item_id)
+        balance = round(st["quantity"] + change, 4)
+        self.conn.execute("UPDATE stock_items SET quantity = ? WHERE id = ?", (balance, stock_item_id))
+        self.conn.execute("INSERT INTO stock_moves (stock_item_id, change, reason, note, card_id, expense_id, balance, "
+                          "created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                          (stock_item_id, round(change, 4), reason, (note or "").strip() or None, card_id, expense_id,
+                           balance, now_str(when)))
+
+    def restock(self, stock_item_id: int, quantity, note: str = "", cost=None, payments=None) -> None:
+        """Add stock. With a cost, it's also recorded as an expense (payment required, like any expense)."""
+        st = self.get_stock_item(stock_item_id)
+        if st is None or not st["active"]:
+            raise BookingError("That inventory item no longer exists.")
+        qty = self._qty(quantity, "Quantity")
+        expense_id = None
+        if cost is not None and str(cost).strip() != "":
+            desc = f"Restock: {fmt_qty(qty)} {st['unit']} {st['name']}" + (f" ({note.strip()})" if note.strip() else "")
+            amount = self._qty(cost, "Cost")
+            checked = self._check_payments(payments, amount, "expense")
+            ts = now_str()
+            expense_id = self.conn.execute("INSERT INTO expenses (description, amount, created_at) VALUES (?, ?, ?)",
+                                           (desc, amount, ts)).lastrowid
+            self._save_payments("expense", expense_id, checked, ts)
+        self._move(stock_item_id, qty, "restock", note, expense_id=expense_id)
+        self.conn.commit()
+
+    def take_out(self, stock_item_id: int, quantity, note: str) -> None:
+        """Remove stock that wasn't sold on a card (waste, broken, own use...). A reason is required."""
+        st = self.get_stock_item(stock_item_id)
+        qty = self._qty(quantity, "Quantity")
+        if not (note or "").strip():
+            raise BookingError("Write the reason (for example: expired, broken, staff).")
+        if qty > st["quantity"] + 1e-9:
+            raise BookingError(f"Only {fmt_qty(st['quantity'])} {st['unit']} in stock.")
+        self._move(stock_item_id, -qty, "take_out", note)
+        self.conn.commit()
+
+    def set_count(self, stock_item_id: int, counted, note: str = "") -> None:
+        """Stock count: set the quantity to what was counted on the shelf; the difference is logged."""
+        st = self.get_stock_item(stock_item_id)
+        counted = self._qty(counted, "Counted quantity", allow_zero=True)
+        diff = round(counted - st["quantity"], 4)
+        if diff:
+            self._move(stock_item_id, diff, "count", note)
+            self.conn.commit()
+
+    def stock_moves(self, stock_item_id: int | None = None, limit: int = 200):
+        sql = ("SELECT m.*, s.name, s.unit FROM stock_moves m JOIN stock_items s ON s.id = m.stock_item_id")
+        args = []
+        if stock_item_id is not None:
+            sql += " WHERE m.stock_item_id = ?"
+            args.append(stock_item_id)
+        return self.conn.execute(sql + " ORDER BY m.id DESC LIMIT ?", args + [limit]).fetchall()
+
+    def sell_stock_item(self, stock_item_id: int, price, category: str, name: str | None = None) -> int:
+        """Put an inventory item on the menu (so it shows in "+ Items"), linked 1 unit per sale.
+        A menu item with the same name is linked instead of creating a duplicate."""
+        st = self.get_stock_item(stock_item_id)
+        if st is None or not st["active"]:
+            raise BookingError("That inventory item no longer exists.")
+        name = " ".join((name or st["name"]).split())
+        existing = self.conn.execute("SELECT id FROM menu_items WHERE active = 1 AND lower(name) = lower(?)",
+                                     (name,)).fetchone()
+        if existing:
+            item_id = existing["id"]
+        else:
+            item_id = self.add_menu_item(name, category, price)
+        self.set_menu_stock(item_id, stock_item_id, 1)
+        return item_id
+
+    def menu_items_for_stock(self, stock_item_id: int):
+        return self.conn.execute("SELECT * FROM menu_items WHERE active = 1 AND stock_item_id = ? ORDER BY position",
+                                 (stock_item_id,)).fetchall()
+
+    def stock_left_for(self, menu_item) -> float | None:
+        """How many more of a menu item can be sold from stock (None = not tracked)."""
+        sid, per = self._menu_stock(menu_item)
+        if sid is None:
+            return None
+        return self.get_stock_item(sid)["quantity"] / per

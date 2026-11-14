@@ -1,7 +1,7 @@
 # UpSpace · Bookings & Billing
 
 A small Windows desktop app for the UpSpace accountant: room bookings, hall chairs, live timers,
-a drinks & food menu, checkout bills, expenses and the daily money total. Python + Qt (PySide6) + SQLite.
+a drinks & food menu, customers with lifetime statistics, an inventory, checkout bills, expenses and the daily money total. Python + Qt (PySide6) + SQLite.
 
 ## Run it
 1. Install Python 3.10 or newer from python.org (tick **"Add python.exe to PATH"** during setup).
@@ -34,6 +34,21 @@ Menu prices are copied onto the card when items are added, so editing or removin
 ## Menu
 Each item has a name, a category and either one price or sizes (Small / Medium / Large, at least two).
 The first start fills the menu with the UpSpace drinks list; after that it's fully editable in the Menu tab.
+
+## Customers
+Every card needs the customer's **phone**, which is the customer's unique key. A new phone saves the customer
+automatically; a known phone fills in the registered name. Typing a different name for a known phone shows a popup
+("registered before with the name …"): names and phones are changed only in **Customers**.
+The Customers page has two tabs: **Customers** (search, add, edit) and **Statistics** (one customer or all, for all time,
+this month, the last 30 days, this year or custom dates): visits, time, rooms vs hall, drinks & add-ons, money spent,
+visit history and top customers, with **Export to Excel**. Only closed bills count.
+
+## Inventory
+Stock items (water bottles, cans, snacks…) with a unit and a low-stock alert level. A menu item can be linked to a
+stock item (1 unit per sale for every size by default); drinks made fresh stay unlinked. Adding items to a card
+subtracts stock; removing an item or cancelling the card puts it back. Not enough stock → the item is blocked with
+an "Out of stock" popup that can open the Inventory with Restock ready. **Restock** (optionally recorded as an
+expense), **Adjust** (take out with a reason, or a stock count) and a full movement history.
 
 ## Money report (Excel)
 On the Money page, **Download report** saves an .xlsx file for a date range (default: the first day with data

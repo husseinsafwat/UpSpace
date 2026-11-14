@@ -42,7 +42,7 @@ class Menu(unittest.TestCase):
 
     def test_edit_keeps_old_bills(self):
         room = self.db.add_room("A", 100)
-        cid = self.db.open_room_card("Ali", "", room)
+        cid = self.db.open_room_card("Ali", "01000000001", room)
         latte = self.find("Latte")
         self.db.add_items(cid, [(latte["id"], "M", 2)])
         self.db.update_menu_item(latte["id"], "Latte", "Hot Drinks", sizes={"S": 60, "M": 70})
@@ -61,7 +61,7 @@ class CartToCard(unittest.TestCase):
 
     def test_hall_card_items_and_bill(self):
         start = datetime.now() - timedelta(minutes=160)
-        cid = self.db.open_hall_card("G", "", 3, when=start)
+        cid = self.db.open_hall_card("G", "01000000006", 3, when=start)
         self.db.add_items(cid, [(self.ids["Latte"], "S", 2), (self.ids["Tea"], None, 1),
                                 (self.ids["Flavor"], None, 1), (self.ids["Tea"], None, 0)])
         self.assertEqual(len(self.db.card_items(cid)), 3)            # qty 0 skipped
@@ -71,7 +71,7 @@ class CartToCard(unittest.TestCase):
         self.assertEqual(bill.total, 260)
 
     def test_bad_size_or_empty_cart(self):
-        cid = self.db.open_hall_card("G", "", 1)
+        cid = self.db.open_hall_card("G", "01000000006", 1)
         with self.assertRaises(BookingError):
             self.db.add_items(cid, [(self.ids["Latte"], None, 1)])   # needs a size
         with self.assertRaises(BookingError):
@@ -93,17 +93,17 @@ class HallSettings(unittest.TestCase):
         self.db.set_hall_settings(20, [20, 15, 10, 5])
         self.assertEqual(self.db.free_chairs(), 20)
         start = datetime.now() - timedelta(hours=10)
-        cid = self.db.open_hall_card("G", "", 2, when=start)
+        cid = self.db.open_hall_card("G", "01000000006", 2, when=start)
         self.assertEqual(self.db.close_card(cid, end=start + timedelta(hours=10), payments=[(self.db.cash_account_id(), None)]).time_cost, 100)  # cap 50 x 2
 
     def test_open_card_keeps_its_prices(self):
         start = datetime.now() - timedelta(minutes=160)
-        cid = self.db.open_hall_card("G", "", 3, when=start)
+        cid = self.db.open_hall_card("G", "01000000006", 3, when=start)
         self.db.set_hall_settings(16, [30, 30, 30, 30])
         self.assertEqual(self.db.close_card(cid, end=start + timedelta(minutes=160), payments=[(self.db.cash_account_id(), None)]).time_cost, 120)
 
     def test_validation(self):
-        self.db.open_hall_card("G", "", 10)
+        self.db.open_hall_card("G", "01000000006", 10)
         for chairs, tiers in [(9, [15, 15, 10, 10]), (0, [15, 15, 10, 10]), ("x", [15, 15, 10, 10]),
                               (16, [15, -1, 10, 10]), (16, [0, 0, 0, 0]), (16, ["a", 1, 1, 1])]:
             with self.assertRaises(BookingError, msg=(chairs, tiers)):
