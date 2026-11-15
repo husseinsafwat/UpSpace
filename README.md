@@ -7,7 +7,8 @@ a drinks & food menu, customers with lifetime statistics, an inventory, checkout
 1. Install Python 3.10 or newer from python.org (tick **"Add python.exe to PATH"** during setup).
 2. Double-click **`run_upspace.bat`**. The first run installs the two libraries it needs, then opens the app.
    (Or from a terminal: `pip install -r requirements.txt` then `python main.py`.)
-3. Sign in with the UpSpace account.
+3. Sign in. The first start creates the admin account: **admin@gmail.com / admin**
+   (change it any time with **Change password** at the bottom of the sidebar).
 
 Optional: double-click `build_exe.bat` to make `dist\UpSpace\UpSpace.exe`, which runs without Python installed.
 
@@ -23,7 +24,7 @@ Back this file up (copy it somewhere safe) now and then.
 | Room discount | per card: EGP off each hour, or % off the hourly price. Never applies to drinks. |
 | Hall time | minimum 1 hour; after that, under 30 min extra is dropped, 30 min or more = full hour. Per chair: 15 + 15 + 10 + 10 for hours 1–4 (max 50, set in **Settings**). × number of chairs. No discount. |
 | Hall chairs | 16 in total (set in **Settings**). A booking can't take more than the free chairs. A group starts together on one card; chairs can't be added later, only drinks. |
-| Drinks, food & add-ons | only from the **Menu** tab. On a card, **+ Items** opens the menu: press + / − per item (and size), then **Review & confirm**. Add-ons are their own lines. |
+| Drinks, food & add-ons | only from the **Menu** tab. On a card, **+ Items** opens the menu: press + / − per item (and size), then **Review & confirm**. Add-ons are their own lines. **Edit items** on an open card changes quantities or removes items; what is taken off goes back to the inventory. |
 | Total | time cost + drinks/add-ons, **rounded to the nearest pound** (158.33 → 158, 158.50 → 159). |
 | Payment | required at checkout. Tick one account (Cash, or a Vodafone Cash / InstaPay account) and it takes the whole bill; tick two or more and type each amount: they must add up **exactly** to the total, otherwise a popup explains the difference. Expenses follow the same rules. |
 | Money page | for the chosen day (today by default): money in from closed bills, minus expenses = total now. Open cards are shown separately and counted at checkout. |
@@ -37,7 +38,8 @@ The first start fills the menu with the UpSpace drinks list; after that it's ful
 
 ## Customers
 Every card needs the customer's **phone**, which is the customer's unique key. A new phone saves the customer
-automatically; a known phone fills in the registered name. Typing a different name for a known phone shows a popup
+automatically; a known phone fills in the registered name. While typing 2+ letters of a name or 2+ digits of a phone on
+a new card, matching customers are suggested; picking one fills in both fields. Typing a different name for a known phone shows a popup
 ("registered before with the name …"): names and phones are changed only in **Customers**.
 The Customers page has two tabs: **Customers** (search, add, edit) and **Statistics** (one customer or all, for all time,
 this month, the last 30 days, this year or custom dates): visits, time, rooms vs hall, drinks & add-ons, money spent,
@@ -61,10 +63,38 @@ Settings → Payment accounts: Cash is always there; add every Vodafone Cash num
 The Money page and the Excel report show money in, money out and the balance for each account and method.
 
 ## Settings
-The **Settings** tab holds the hall (number of chairs, price per chair for hours 1–4) and the rooms
-(name + price per hour). `config.py` holds the starting hall values and the login. The password is stored as a SHA-256 hash; to
-change it, put the output of
-`python -c "import hashlib;print(hashlib.sha256(b'NEW-PASSWORD').hexdigest())"` in `LOGIN_PASSWORD_SHA256`.
+The **Settings** tab holds the hall (number of chairs, price per chair for hours 1–4), the rooms
+(name + price per hour) and the payment accounts. `config.py` holds the starting hall values.
+
+## Users and permissions
+- The **admin** (admin@gmail.com) can do everything. Only the admin sees **Settings → Users** and the reset button.
+- The admin adds users (name, email, password) and ticks what each one may see and do, page by page
+  (e.g. Menu: view / edit). **Everything is off by default.** Pages a user can't view are hidden from the sidebar,
+  and buttons they can't use are hidden.
+- **Templates**: a set of ticks saved under a name. "Normal user" comes ready: everything in Rooms and Hall, the
+  customer list (view only), and in Money: see money in and expenses, add expenses and set today's cash. No report
+  download, no previous dates. The admin can apply, change or save new templates in the user popup.
+- Users can be disabled or deleted; bookings and expenses they made keep their name ("By" columns on the Money page).
+- Passwords are stored as salted PBKDF2-SHA256 hashes, never as text.
+
+## Deleting a customer
+Deleting a customer removes them from the customer list (and from suggestions), but their past bills stay exactly as
+they were: each bill keeps its own copy of the name, phone and amounts. Money totals, reports and the "All customers"
+statistics don't change; in Top customers their visits appear as one "Deleted customers" row. A customer with an
+open card can't be deleted until it is checked out or cancelled. If the same phone comes back later, it starts as a
+new customer.
+
+## Cash drawer
+The Money page has a **Cash drawer** box for the day. The drawer starts at 0; **Edit opening cash** sets the cash you
+started with, and **+ Add cash** records cash put in during the day. **Cash in drawer now** = opening cash + cash added
++ cash taken at checkout − cash paid for expenses. Opening and added cash are **not income**. Each day starts at 0
+again. The Excel report shows these lines on every day sheet.
+
+## Reset app data (admin)
+Settings → Danger zone → **Reset app data…**: type the admin password twice and RESET. It deletes all bookings,
+bills, payments, expenses, customers, stock movements and cash drawer entries; the menu, rooms, prices, payment
+accounts, inventory items (quantities set to 0) and users are kept. A full copy of the database is saved first in
+the `backups` folder next to `upspace.db`.
 
 ## Tests
 `python -m unittest discover tests`

@@ -137,6 +137,14 @@ def _day_sheet(wb, db: Database, d: date, s: dict):
         ("Expenses", s["expenses_total"], MONEY),
         ("Total (in − expenses)", s["net"], MONEY),
     ]
+    cash = db.cash_drawer(d, s["accounts"])
+    rows += [
+        ("Opening cash (not income)", cash["opening"], MONEY),
+        ("Cash added to the drawer (not income)", cash["added_total"], MONEY),
+        ("Cash taken at checkout", cash["cash_in"], MONEY),
+        ("Cash paid for expenses", cash["cash_out"], MONEY),
+        ("Cash in drawer (end of day)", cash["drawer"], MONEY),
+    ]
     r = 4
     _header(ws, r, ["Summary", "", "", "Amount"], money_cols=(4,))
     for label, value, fmt in rows:
@@ -145,7 +153,7 @@ def _day_sheet(wb, db: Database, d: date, s: dict):
         cell = ws.cell(row=r, column=4, value=value)
         if fmt:
             cell.number_format = fmt
-        if label in ("Money in", "Total (in − expenses)"):
+        if label in ("Money in", "Total (in − expenses)", "Cash in drawer (end of day)"):
             for c in range(1, 5):
                 ws.cell(row=r, column=c).font = BOLD
                 ws.cell(row=r, column=c).fill = LIGHT
@@ -166,7 +174,7 @@ def _day_sheet(wb, db: Database, d: date, s: dict):
             p["label"] + (f" ({p['amount']:g})" if len(paid) > 1 else "") for p in paid) or "Not recorded")
         ws.cell(row=r, column=4, value=e["amount"]).number_format = MONEY
         r += 1
-    _widths(ws, [30, 14, 34, 16, 14, 14])
+    _widths(ws, [38, 14, 34, 16, 14, 14])
     ws.sheet_view.showGridLines = False
 
 
@@ -181,7 +189,8 @@ def build_report(db: Database, start: date, end: date, path: str) -> dict:
     for d in days(start, end):
         s = db.summary(d, d)
         per_day.append((d, s))
-        if s["cards"] or s["expenses"]:
+        if s["cards"] or s["expenses"] or db.conn.execute("SELECT 1 FROM cash_drawer WHERE day = ?",
+                                                            (d.isoformat(),)).fetchone():
             _day_sheet(wb, db, d, s)
 
     ws = wb.create_sheet("Total")

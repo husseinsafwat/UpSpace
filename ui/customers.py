@@ -50,19 +50,22 @@ def place(c) -> str:
 class CustomersPage(Page):
     def __init__(self, app):
         super().__init__(app, "Customers", "Every customer is saved by phone number when a card starts.")
+        can_list, can_stats = self.db.can("customers.view"), self.db.can("customers.stats")
         self.tabs = QButtonGroup(self)
         for i, t in enumerate(("Customers", "Statistics")):
             b = button(t, kind="Chip")
             b.setCheckable(True)
-            b.setChecked(i == 0)
+            b.setChecked(i == (0 if can_list else 1))
             self.tabs.addButton(b, i)
-            self.toolbar.addWidget(b)
+            if can_list and can_stats:          # tabs only when there is a choice
+                self.toolbar.addWidget(b)
         self.tabs.idClicked.connect(self.switch)
         self.stack = QStackedWidget()
         self.manage = ManageTab(self)
         self.stats = StatsTab(self)
         self.stack.addWidget(self.manage)
         self.stack.addWidget(self.stats)
+        self.stack.setCurrentIndex(0 if can_list else 1)
         self.body.addWidget(self.stack, 1)
 
     def switch(self, i: int):
@@ -91,7 +94,11 @@ class ManageTab(QWidget):
         self.count = label("", "Sub")
         bar.addWidget(self.count)
         bar.addStretch(1)
-        bar.addWidget(button("+ New customer", lambda: self.edit(None), "Primary"))
+        db = self.db
+        self.can_edit, self.can_delete, self.can_stats = (db.can("customers.edit"), db.can("customers.delete"),
+                                                          db.can("customers.stats"))
+        if self.can_edit:
+            bar.addWidget(button("+ New customer", lambda: self.edit(None), "Primary"))
         lay.addLayout(bar)
         box = panel()
         bl = vbox(box, margins=(6, 6, 6, 6))
@@ -113,11 +120,16 @@ class ManageTab(QWidget):
         out = []
         for c in rows:
             name = c["name"] + ("  ·  here now" if c["open_cards"] else "")
+            btns = []
+            if self.can_stats:
+                btns.append(small("Statistics", lambda _=False, i=c["id"]: self.page.show_stats(i)))
+            if self.can_edit:
+                btns.append(small("Edit", lambda _=False, c=c: self.edit(c)))
+            if self.can_delete:
+                btns.append(small("Remove", lambda _=False, c=c: self.remove(c), True))
             out.append([name, c["phone"], c["visits"], money(c["spent"]),
                         (c["last_visit"] or "")[:10] or "—", c["created_at"][:10], c["notes"] or "",
-                        actions(small("Statistics", lambda _=False, i=c["id"]: self.page.show_stats(i)),
-                                small("Edit", lambda _=False, c=c: self.edit(c)),
-                                small("Remove", lambda _=False, c=c: self.remove(c), True))])
+                        actions(*btns) if btns else ""])
         self.table.set_rows(out or [["No customers found.", "", "", "", "", "", "", ""]])
 
     def edit(self, customer):
@@ -125,8 +137,13 @@ class ManageTab(QWidget):
             self.page.app.data_changed()
 
     def remove(self, c):
-        if not confirm(self.window(), "Remove customer?", f"“{c['name']}” ({c['phone']}) will be removed.",
-                       "Remove"):
+        if c["visits"]:
+            msg = (f"“{c['name']}” ({c['phone']}) will be deleted from the customer list.\n\n"
+                   f"Their {c['visits']} past visit(s) and {money(c['spent'])} stay in the money totals and "
+                   "statistics (under “Deleted customers”). This can't be undone.")
+        else:
+            msg = f"“{c['name']}” ({c['phone']}) will be deleted."
+        if not confirm(self.window(), "Delete customer?", msg, "Delete"):
             return
         try:
             self.db.remove_customer(c["id"])
@@ -169,8 +186,9 @@ class StatsTab(QWidget):
         bar.addWidget(self.start_f)
         bar.addWidget(self.end_f)
         bar.addStretch(1)
-        exp = button("Export to Excel", self.export)
-        bar.addWidget(exp, 0, Qt.AlignBottom)
+        if self.db.can("customers.export"):
+            exp = button("Export to Excel", self.export)
+            bar.addWidget(exp, 0, Qt.AlignBottom)
         lay.addLayout(bar)
         self._period_changed(0)
 
@@ -295,7 +313,7 @@ class StatsTab(QWidget):
         self.history_box.setVisible(one)
         period = "All time" if start is None else f"{start:%d %b %Y} – {end:%d %b %Y}"
 
-        if one:
+        if one and self.db.get_customer(cid) is not None:
             c = self.db.get_customer(cid)
             self.p_name.setText(c["name"])
             info = f"{c['phone']}  ·  customer since {c['created_at'][:10]}  ·  {period}"
@@ -328,7 +346,10 @@ class StatsTab(QWidget):
         self.items.fit_height()
 
         if not one:
-            top = self.db.top_customers(start, end, limit=50)
+            top = list(self.db.top_customers(start, end, limit=50))
+            gone = self.db.removed_customers_total(start, end)
+            if gone:
+                top.append(gone)
             self.top.set_rows([[n, r["name"], r["phone"], r["visits"], fmt_duration(r["minutes"] or 0),
                                 int(r["items_count"]), money(r["items_spent"] or 0), money(r["total"] or 0),
                                 (r["last_visit"] or "")[:10]] for n, r in enumerate(top, start=1)]
