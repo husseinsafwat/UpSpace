@@ -968,3 +968,274 @@ class ReportDialog(Dialog):
             return self.show_error(str(e))
         self.accept()
         alert(self.parent(), "Report saved", f"{os.path.basename(path)}\n{start:%d %b %Y} to {end:%d %b %Y}")
+
+
+# ------------------------------------------------------------------------- v2.2: items on a card
+class EditItemsDialog(Dialog):
+    """Change quantities of items already on an open card, or remove them. Stock goes back on Save."""
+
+    def __init__(self, parent, db: Database, card):
+        place = card["room_name"] if card["kind"] == "room" else f"Hall · {card['chairs']} chair(s)"
+        super().__init__(parent, "Edit items", 520, f"{card['customer_name']}  ·  {place}. "
+                                                   "Lowered or removed items go back to the inventory.")
+        self.db, self.card = db, card
+        self.items = {it["id"]: it for it in db.card_items(card["id"])}
+        self.qty = {i: int(it["qty"] or 1) for i, it in self.items.items()}
+        self.labels: dict[int, object] = {}
+        self.totals: dict[int, object] = {}
+        box = panel("Soft")
+        bl = vbox(box, margins=(14, 8, 10, 8), spacing=4)
+        if not self.items:
+            bl.addWidget(label("No items on this card.", "Sub"))
+        for i, it in self.items.items():
+            row = hbox(spacing=8)
+            name = it["name"] + (f" ({it['size']})" if it["size"] else "")
+            row.addWidget(label(name, "H3"), 1)
+            row.addWidget(button("−", lambda _=False, i=i: self.change(i, -1), "Step"))
+            n = label("", "H3")
+            n.setFixedWidth(26)
+            n.setAlignment(Qt.AlignCenter)
+            self.labels[i] = n
+            row.addWidget(n)
+            row.addWidget(button("+", lambda _=False, i=i: self.change(i, 1), "StepPlus"))
+            t = label("")
+            t.setFixedWidth(90)
+            t.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            self.totals[i] = t
+            row.addWidget(t)
+            row.addWidget(button("Remove", lambda _=False, i=i: self.change(i, -10_000), "Link"))
+            bl.addLayout(row)
+        self.body.addWidget(box)
+        self.total = label("", "H3")
+        self.body.addWidget(self.total)
+        self.save_btn = self.buttons("Save changes", self.save)
+        self.refresh()
+
+    def unit(self, i) -> float:
+        it = self.items[i]
+        return it["unit_price"] if it["unit_price"] is not None else it["price"] / (it["qty"] or 1)
+
+    def change(self, i, delta):
+        self.qty[i] = max(0, self.qty[i] + delta)
+        self.refresh()
+
+    def refresh(self):
+        for i, n in self.labels.items():
+            q = self.qty[i]
+            n.setText(str(q) if q else "0")
+            self.totals[i].setText(money(self.unit(i) * q) if q else "removed")
+        self.total.setText(f"Items total: {money(sum(self.unit(i) * q for i, q in self.qty.items()))}")
+
+    def changes(self) -> dict:
+        return {i: q for i, q in self.qty.items() if q != int(self.items[i]["qty"] or 1)}
+
+    def save(self):
+        if not self.changes():
+            return self.reject()
+        try:
+            self.db.set_item_quantities(self.card["id"], self.changes())
+        except OutOfStock as e:
+            return self.show_error(str(e))
+        except BookingError as e:
+            return self.show_error(str(e))
+        self.accept()
+
+
+# ------------------------------------------------------------------------- v2.2: cash drawer
+class CashDialog(Dialog):
+    """Opening cash for a day (kind 'opening'), or cash added to the drawer (kind 'add', new or edit)."""
+
+    def __init__(self, parent, db: Database, day: date, kind: str, entry=None, current: float = 0):
+        opening = kind == "opening"
+        title = "Opening cash" if opening else ("Edit added cash" if entry else "Add cash to the drawer")
+        sub = (f"The cash in the drawer when {day:%a %d %b} started. It is not counted as income."
+               if opening else "Cash put in the drawer during the day (change, owner…). It is not income.")
+        super().__init__(parent, title, 440, sub)
+        self.db, self.day, self.kind, self.entry = db, day, kind, entry
+        self.amount = line_edit("e.g. 500")
+        self.body.addWidget(field(f"Amount ({CURRENCY})", self.amount))
+        self.note = line_edit("Optional")
+        if opening:
+            self.amount.setText(fmt_money(current).replace(",", ""))
+        else:
+            self.body.addWidget(field("Note", self.note))
+            if entry:
+                self.amount.setText(fmt_money(entry["amount"]).replace(",", ""))
+                self.note.setText(entry["note"] or "")
+        self.amount.selectAll()
+        self.buttons("Save", self.save)
+
+    def save(self):
+        try:
+            if self.kind == "opening":
+                self.db.set_opening_cash(self.day, self.amount.text())
+            elif self.entry:
+                self.db.update_cash(self.entry["id"], self.amount.text(), self.note.text())
+            else:
+                self.db.add_cash(self.day, self.amount.text(), self.note.text())
+        except BookingError as e:
+            return self.show_error(str(e))
+        self.accept()
+
+
+# ------------------------------------------------------------------------- v2.2: accounts
+def password_edit(placeholder: str = ""):
+    from PySide6.QtWidgets import QLineEdit
+    e = line_edit(placeholder)
+    e.setEchoMode(QLineEdit.Password)
+    return e
+
+
+class ChangePasswordDialog(Dialog):
+    def __init__(self, parent, db: Database):
+        super().__init__(parent, "Change password", 420, f"Signed in as {db.user['email']}.")
+        self.db = db
+        self.current, self.new, self.again = password_edit(), password_edit("At least 4 characters"), password_edit()
+        self.body.addWidget(field("Current password", self.current))
+        self.body.addWidget(field("New password", self.new))
+        self.body.addWidget(field("New password again", self.again))
+        self.buttons("Change password", self.save)
+
+    def save(self):
+        try:
+            self.db.change_password(self.current.text(), self.new.text(), self.again.text())
+        except BookingError as e:
+            return self.show_error(str(e))
+        self.accept()
+        alert(self.parent(), "Password changed", "Use the new password next time you sign in.")
+
+
+class UserDialog(Dialog):
+    """Admin: create or edit a user and tick what they may see and do. Everything starts unticked."""
+
+    def __init__(self, parent, db: Database, user=None):
+        import auth
+        is_admin = bool(user and user["is_admin"])
+        super().__init__(parent, "Edit user" if user else "New user", 760,
+                         "The admin account always has every permission." if is_admin else
+                         "Tick what this user may see and do. Nothing is allowed until you tick it.")
+        self.db, self.user, self.is_admin = db, user, is_admin
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(12)
+        self.name, self.email = line_edit("Full name"), line_edit("e.g. sara@gmail.com")
+        self.password = password_edit("At least 4 characters" if not user else "Leave empty to keep the password")
+        grid.addWidget(field("Name", self.name), 0, 0)
+        grid.addWidget(field("Email (used to sign in)", self.email), 0, 1)
+        grid.addWidget(field("Password" if not user else "New password", self.password), 0, 2)
+        self.body.addLayout(grid)
+        self.active = QCheckBox("Account is active (can sign in)")
+        self.active.setChecked(True)
+        if user:
+            self.name.setText(user["name"])
+            self.email.setText(user["email"])
+            self.active.setChecked(bool(user["active"]))
+        self.checks: dict[str, QCheckBox] = {}
+        if not is_admin:
+            self.body.addWidget(self.active)
+            bar = hbox(spacing=8)
+            self.template = QComboBox()
+            self.template.setMinimumWidth(200)
+            self._fill_templates()
+            bar.addWidget(label("Template:"))
+            bar.addWidget(self.template)
+            bar.addWidget(button("Apply", self.apply_template))
+            bar.addWidget(button("Save as template…", self.save_template))
+            bar.addStretch(1)
+            bar.addWidget(button("Tick all", lambda: self._set_all(True), "Link"))
+            bar.addWidget(button("Clear all", lambda: self._set_all(False), "Link"))
+            self.body.addLayout(bar)
+            perms_box = QWidget()
+            pg = QGridLayout(perms_box)
+            pg.setContentsMargins(0, 0, 0, 0)
+            pg.setHorizontalSpacing(18)
+            pg.setVerticalSpacing(4)
+            have = set(db.user_perms(user["id"])) if user else set()
+            for n, (group, perms) in enumerate(auth.PERMISSION_GROUPS):
+                col = vbox(spacing=3)
+                col.addWidget(caps(group))
+                for key, text in perms:
+                    cb = QCheckBox(text)
+                    cb.setChecked(key in have)
+                    self.checks[key] = cb
+                    col.addWidget(cb)
+                pg.addLayout(col, n // 3, n % 3, Qt.AlignTop)
+            pg.setRowStretch((len(auth.PERMISSION_GROUPS) + 2) // 3, 1)
+            sc = QScrollArea()
+            sc.setWidgetResizable(True)
+            sc.setFrameShape(QFrame.NoFrame)
+            sc.setWidget(perms_box)
+            sc.setMinimumHeight(430)
+            self.body.addWidget(sc, 1)
+        self.buttons("Save", self.save)
+
+    def _fill_templates(self):
+        self.template.clear()
+        for t in self.db.list_templates():
+            self.template.addItem(t["name"], t["id"])
+
+    def _set_all(self, on: bool):
+        for cb in self.checks.values():
+            cb.setChecked(on)
+
+    def perms(self) -> list[str]:
+        return [k for k, cb in self.checks.items() if cb.isChecked()]
+
+    def apply_template(self):
+        t = next((t for t in self.db.list_templates() if t["id"] == self.template.currentData()), None)
+        if t is None:
+            return
+        want = set(self.db.template_perms(t))
+        for k, cb in self.checks.items():
+            cb.setChecked(k in want)
+
+    def save_template(self):
+        from PySide6.QtWidgets import QInputDialog
+        name, ok = QInputDialog.getText(self, "Save as template", "Template name:",
+                                        text=self.template.currentText())
+        if not ok:
+            return
+        try:
+            tid = self.db.save_template(name, self.perms())
+        except BookingError as e:
+            return self.show_error(str(e))
+        self._fill_templates()
+        self.template.setCurrentIndex(max(0, self.template.findData(tid)))
+
+    def save(self):
+        try:
+            if self.user:
+                self.db.update_user(self.user["id"], self.name.text(), self.email.text(),
+                                    perms=None if self.is_admin else self.perms(),
+                                    active=self.active.isChecked(), password=self.password.text() or None)
+            else:
+                self.db.add_user(self.name.text(), self.email.text(), self.password.text(), self.perms())
+        except BookingError as e:
+            return self.show_error(str(e))
+        self.accept()
+
+
+class ResetDialog(Dialog):
+    """Admin only: wipe all activity after typing the admin password twice and RESET."""
+
+    def __init__(self, parent, db: Database):
+        super().__init__(parent, "Reset app data", 500,
+                         "This deletes all bookings, bills, payments, expenses, customers, stock movements and "
+                         "cash drawer entries. The menu, rooms, hall prices, payment accounts, inventory items "
+                         "and users are kept (stock quantities go to 0). A backup copy is saved first.")
+        self.db = db
+        self.p1, self.p2 = password_edit(), password_edit()
+        self.word = line_edit("Type RESET")
+        self.body.addWidget(field("Admin password", self.p1))
+        self.body.addWidget(field("Admin password again", self.p2))
+        self.body.addWidget(field("Type RESET to confirm", self.word))
+        self.backup_path = None
+        self.buttons("Reset app data", self.save, danger=True)
+
+    def save(self):
+        if self.word.text().strip() != "RESET":
+            return self.show_error("Type RESET in capital letters to confirm.")
+        try:
+            self.backup_path = self.db.reset_app_data(self.p1.text(), self.p2.text())
+        except BookingError as e:
+            return self.show_error(str(e))
+        self.accept()

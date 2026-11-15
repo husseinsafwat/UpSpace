@@ -71,7 +71,10 @@ def build_customer_report(db: Database, customer_id: int | None, start: date | N
                  f"Total spent ({CURRENCY})", "Last visit"]
         _header(ws, row, heads, money_cols=(4, 6, 7, 8))
         row += 1
-        top = db.top_customers(start, end)
+        top = list(db.top_customers(start, end))
+        gone = db.removed_customers_total(start, end)
+        if gone:
+            top.append(gone)
         for i, r in enumerate(top, start=1):
             values = [i, r["name"], r["phone"], r["visits"], fmt_duration(r["minutes"] or 0), int(r["items_count"]),
                       round(r["items_spent"] or 0, 2), round(r["total"] or 0, 2), (r["last_visit"] or "")[:10]]

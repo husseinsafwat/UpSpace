@@ -1,9 +1,7 @@
 """App-wide settings for the UpSpace booking & billing app."""
 
-# --- Login (single fixed account, no sign-up) --------------------------------
-LOGIN_EMAIL = "upspace@gmail.com"
-# SHA-256 of the password, so the password itself is not stored in plain text.
-LOGIN_PASSWORD_SHA256 = "1e1812310856b6e79b5fe1aaeec2d0c89eb4d291f828c906ac2b683c7ac03c33"
+# Accounts live in the database since v2.2 (see auth.py). First start creates the admin:
+# admin@gmail.com / admin. The admin adds users in Settings > Users.
 
 # --- Hall (starting values; change them in the app's Settings tab) -------------
 HALL_TOTAL_CHAIRS = 16

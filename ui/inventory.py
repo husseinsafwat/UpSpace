@@ -24,7 +24,8 @@ class InventoryPage(Page):
     def __init__(self, app):
         super().__init__(app, "Inventory", "What you have in stock. Menu items linked to a stock item take from it "
                                            "on every sale; removing an item from a card puts it back.")
-        self.toolbar.addWidget(button("+ New item", lambda: self.edit(None), "Primary"))
+        if self.db.can("inventory.edit"):
+            self.toolbar.addWidget(button("+ New item", lambda: self.edit(None), "Primary"))
 
         content = QWidget()
         content.setObjectName("Content")
@@ -86,12 +87,17 @@ class InventoryPage(Page):
             uses.setdefault(m["stock_item_id"], []).append(m["name"])
         rows = []
         for st in stock:
+            btns = []
+            if self.db.can("inventory.restock"):
+                btns.append(small("Restock", lambda _=False, i=st["id"]: self.restock(i)))
+            if self.db.can("inventory.adjust"):
+                btns.append(small("Adjust", lambda _=False, i=st["id"]: self.adjust(i)))
+            if self.db.can("inventory.edit"):
+                btns += [small("Edit", lambda _=False, s=st: self.edit(s)),
+                         small("Remove", lambda _=False, s=st: self.remove(s), True)]
             rows.append([st["name"], f"{fmt_qty(st['quantity'])} {st['unit']}", fmt_qty(st["low_level"]),
                          status_of(st), ", ".join(uses.get(st["id"], [])) or "Not on the menu (Edit to sell it)",
-                         actions(small("Restock", lambda _=False, i=st["id"]: self.restock(i)),
-                                 small("Adjust", lambda _=False, i=st["id"]: self.adjust(i)),
-                                 small("Edit", lambda _=False, s=st: self.edit(s)),
-                                 small("Remove", lambda _=False, s=st: self.remove(s), True))])
+                         actions(*btns) if btns else ""])
         if rows:
             self.table.set_rows(rows)
             for r, st in enumerate(stock):
@@ -143,7 +149,7 @@ class InventoryPage(Page):
 
     def restock(self, stock_item_id):
         st = self.db.get_stock_item(stock_item_id)
-        if st is not None and st["active"]:
+        if st is not None and st["active"] and self.db.can("inventory.restock"):
             self._done(RestockDialog(self.window(), self.db, st))
 
     def adjust(self, stock_item_id):

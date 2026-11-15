@@ -6,6 +6,7 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 
+import auth
 import pricing
 from config import HALL_HOUR_TIERS, HALL_TOTAL_CHAIRS
 
@@ -109,6 +110,36 @@ CREATE TABLE IF NOT EXISTS stock_moves (
     balance       REAL NOT NULL,                   -- stock after this move
     created_at    TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS users (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    email         TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    name          TEXT NOT NULL,
+    password_hash TEXT NOT NULL,                   -- salted PBKDF2, never the password itself
+    is_admin      INTEGER NOT NULL DEFAULT 0,
+    active        INTEGER NOT NULL DEFAULT 1,
+    deleted       INTEGER NOT NULL DEFAULT 0,
+    created_at    TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS user_perms (
+    user_id  INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    perm     TEXT NOT NULL,
+    PRIMARY KEY (user_id, perm)
+);
+CREATE TABLE IF NOT EXISTS perm_templates (
+    id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    name   TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    perms  TEXT NOT NULL                           -- comma-separated permission keys
+);
+CREATE TABLE IF NOT EXISTS cash_drawer (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    day         TEXT NOT NULL,                     -- YYYY-MM-DD
+    kind        TEXT NOT NULL CHECK (kind IN ('opening', 'add')),
+    amount      REAL NOT NULL,
+    note        TEXT,
+    created_at  TEXT NOT NULL,
+    created_by  INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_cash_drawer_day ON cash_drawer(day);
 CREATE INDEX IF NOT EXISTS idx_stock_moves_item ON stock_moves(stock_item_id, id);
 CREATE INDEX IF NOT EXISTS idx_payments_ref ON payments(kind, ref_id);
 CREATE INDEX IF NOT EXISTS idx_cards_status ON cards(status);
@@ -120,7 +151,11 @@ CREATE INDEX IF NOT EXISTS idx_expenses_created ON expenses(created_at);
 # Columns added after v1.1. Old databases get them on start-up (ALTER TABLE ... ADD COLUMN).
 MIGRATIONS = {
     "cards": [("hall_tiers", "TEXT"),                  # hall prices copied onto the card at start
-              ("customer_id", "INTEGER")],             # v2.1: link to customers (by phone)
+              ("customer_id", "INTEGER"),              # v2.1: link to customers (by phone)
+              ("customer_removed", "INTEGER NOT NULL DEFAULT 0"),  # v2.2: its customer was deleted
+              ("opened_by", "INTEGER"),                # v2.2: user who opened / closed the card
+              ("closed_by", "INTEGER")],
+    "expenses": [("created_by", "INTEGER")],
     "items": [("qty", "INTEGER NOT NULL DEFAULT 1"),   # price = qty x unit_price (line total)
               ("size", "TEXT"),
               ("unit_price", "REAL"),
@@ -182,6 +217,10 @@ class BookingError(Exception):
     """A rule was broken (room busy, not enough chairs, bad input...)."""
 
 
+class PermissionDenied(BookingError):
+    """The signed-in user isn't allowed to do this."""
+
+
 class NameMismatch(BookingError):
     """The phone is already registered under another name. The UI offers to use the registered name."""
 
@@ -200,6 +239,11 @@ class OutOfStock(BookingError):
         super().__init__(f"\"{menu_name}\" is out of stock. It needs {fmt_qty(needed)} {stock_item['unit']} of "
                          f"\"{stock_item['name']}\", and only {have} {stock_item['unit']} left.\n"
                          "Add quantity to it in the Inventory page first.")
+
+
+def card_perm(kind: str, action: str) -> str:
+    """Permission key for an action on a card: ('room', 'checkout') -> 'rooms.checkout'."""
+    return f"{'rooms' if kind == 'room' else 'hall'}.{action}"
 
 
 def fmt_qty(q) -> str:
@@ -247,6 +291,9 @@ class Bill:
 
 class Database:
     def __init__(self, path: str):
+        self.path = path
+        self.user = None                 # signed-in user row (None = no restrictions, e.g. tests and start-up)
+        self._perms: set[str] = set()
         self.conn = sqlite3.connect(path)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
@@ -254,6 +301,7 @@ class Database:
         self._migrate()
         self._seed_menu()
         self._import_customers()
+        self._seed_users()
         if self.conn.execute("SELECT COUNT(*) FROM payment_accounts WHERE method = 'cash'").fetchone()[0] == 0:
             self.conn.execute("INSERT INTO payment_accounts (method, number, position) VALUES ('cash', NULL, 0)")
         self.conn.commit()
@@ -285,7 +333,7 @@ class Database:
     def _import_customers(self) -> None:
         """v2.1: create customers from old cards that have a phone (newest name wins) and link the cards."""
         rows = self.conn.execute("SELECT id, customer_name, phone, start_time FROM cards "
-                                 "WHERE customer_id IS NULL AND phone IS NOT NULL AND phone != '' "
+                                 "WHERE customer_id IS NULL AND customer_removed = 0 AND phone IS NOT NULL AND phone != '' "
                                  "ORDER BY start_time DESC, id DESC").fetchall()
         for r in rows:
             try:
@@ -301,6 +349,282 @@ class Database:
                 if r["start_time"] < cust["created_at"]:
                     self.conn.execute("UPDATE customers SET created_at = ? WHERE id = ?", (r["start_time"], cid))
             self.conn.execute("UPDATE cards SET customer_id = ? WHERE id = ?", (cid, r["id"]))
+
+    # ------------------------------------------------------------ users / auth
+    def _seed_users(self) -> None:
+        """First start of v2.2: the admin account and the "Normal user" template."""
+        if self.conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
+            self.conn.execute("INSERT INTO users (email, name, password_hash, is_admin, created_at) "
+                              "VALUES (?, 'Admin', ?, 1, ?)",
+                              (auth.ADMIN_EMAIL, auth.hash_password(auth.ADMIN_PASSWORD), now_str()))
+        if not self.get_setting("templates_seeded"):
+            self.conn.execute("INSERT OR IGNORE INTO perm_templates (name, perms) VALUES (?, ?)",
+                              (auth.NORMAL_USER, ",".join(auth.NORMAL_USER_PERMS)))
+            self.set_setting("templates_seeded", "1", commit=False)
+
+    def authenticate(self, email, password):
+        """The user row for a correct email + password, else raise PermissionDenied with the reason."""
+        row = self.conn.execute("SELECT * FROM users WHERE email = ? AND deleted = 0",
+                                ((email or "").strip(),)).fetchone()
+        if row is None or not auth.check_password(password or "", row["password_hash"]):
+            raise PermissionDenied("Wrong email or password.")
+        if not row["active"]:
+            raise PermissionDenied("This account is disabled. Ask the admin.")
+        return row
+
+    def sign_in(self, user) -> None:
+        """Set the signed-in user (None signs out). Permissions are checked against this user."""
+        self.user = user
+        self._perms = set(self.user_perms(user["id"])) if user is not None else set()
+
+    def is_admin(self) -> bool:
+        return self.user is None or bool(self.user["is_admin"])
+
+    def can(self, perm: str) -> bool:
+        """True when the signed-in user may do `perm` (the admin, and no user at all, may do anything)."""
+        return self.is_admin() or perm in self._perms
+
+    def can_any(self, *perms: str) -> bool:
+        return any(self.can(p) for p in perms)
+
+    def _need(self, perm: str) -> None:
+        if not self.can(perm):
+            raise PermissionDenied("You don't have permission to do this. Ask the admin.")
+
+    def _need_admin(self) -> None:
+        if not self.is_admin():
+            raise PermissionDenied("Only the admin can do this.")
+
+    def user_id(self):
+        return self.user["id"] if self.user is not None else None
+
+    def get_user(self, user_id):
+        return self.conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+
+    def list_users(self):
+        return self.conn.execute("SELECT * FROM users WHERE deleted = 0 ORDER BY is_admin DESC, name COLLATE NOCASE"
+                                 ).fetchall()
+
+    def user_names(self) -> dict:
+        """{user id: name} for everyone, deleted users included (old records still show who did them)."""
+        return {r["id"]: r["name"] for r in self.conn.execute("SELECT id, name FROM users")}
+
+    def user_perms(self, user_id) -> list[str]:
+        return [r["perm"] for r in self.conn.execute("SELECT perm FROM user_perms WHERE user_id = ?", (user_id,))]
+
+    @staticmethod
+    def _check_password_input(password) -> str:
+        password = password or ""
+        if len(password) < 4:
+            raise BookingError("The password must have at least 4 characters.")
+        return password
+
+    def _check_user_input(self, name, email, exclude_id=None):
+        name = " ".join((name or "").split())
+        if not name:
+            raise BookingError("Name is required.")
+        email = (email or "").strip().lower()
+        if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+            raise BookingError("Enter a valid email, e.g. sara@gmail.com.")
+        other = self.conn.execute("SELECT id FROM users WHERE email = ?", (email,)).fetchone()
+        if other is not None and other["id"] != exclude_id:
+            raise BookingError("Another user already has this email.")
+        return name, email
+
+    def _set_perms(self, user_id, perms) -> None:
+        perms = [p for p in dict.fromkeys(perms or []) if p in auth.ALL_PERMISSIONS]
+        self.conn.execute("DELETE FROM user_perms WHERE user_id = ?", (user_id,))
+        self.conn.executemany("INSERT INTO user_perms (user_id, perm) VALUES (?, ?)", [(user_id, p) for p in perms])
+
+    def add_user(self, name, email, password, perms=()) -> int:
+        """Admin only. A new user starts with exactly the permissions given (none by default)."""
+        self._need_admin()
+        name, email = self._check_user_input(name, email)
+        password = self._check_password_input(password)
+        cur = self.conn.execute("INSERT INTO users (email, name, password_hash, created_at) VALUES (?, ?, ?, ?)",
+                                (email, name, auth.hash_password(password), now_str()))
+        self._set_perms(cur.lastrowid, perms)
+        self.conn.commit()
+        return cur.lastrowid
+
+    def update_user(self, user_id, name, email, perms=None, active=True, password=None) -> None:
+        """Admin only. The admin account always keeps every right and can't be disabled."""
+        self._need_admin()
+        u = self.get_user(user_id)
+        if u is None or u["deleted"]:
+            raise BookingError("That user no longer exists.")
+        name, email = self._check_user_input(name, email, exclude_id=user_id)
+        if u["is_admin"]:
+            active = True
+        self.conn.execute("UPDATE users SET name = ?, email = ?, active = ? WHERE id = ?",
+                          (name, email, 1 if active else 0, user_id))
+        if password:
+            self.conn.execute("UPDATE users SET password_hash = ? WHERE id = ?",
+                              (auth.hash_password(self._check_password_input(password)), user_id))
+        if perms is not None and not u["is_admin"]:
+            self._set_perms(user_id, perms)
+        self.conn.commit()
+        if self.user is not None and self.user["id"] == user_id:
+            self.sign_in(self.get_user(user_id))
+
+    def delete_user(self, user_id) -> None:
+        """Admin only. The account can't sign in again; bookings and expenses it made keep its name."""
+        self._need_admin()
+        u = self.get_user(user_id)
+        if u is None or u["deleted"]:
+            return
+        if u["is_admin"]:
+            raise BookingError("The admin account can't be deleted.")
+        self.conn.execute("UPDATE users SET deleted = 1, active = 0, email = email || '#deleted' || id WHERE id = ?",
+                          (user_id,))
+        self.conn.execute("DELETE FROM user_perms WHERE user_id = ?", (user_id,))
+        self.conn.commit()
+
+    def change_password(self, current, new, confirm) -> None:
+        """The signed-in user changes their own password."""
+        if self.user is None:
+            raise PermissionDenied("Sign in first.")
+        u = self.get_user(self.user["id"])
+        if not auth.check_password(current or "", u["password_hash"]):
+            raise BookingError("Your current password is wrong.")
+        new = self._check_password_input(new)
+        if new != (confirm or ""):
+            raise BookingError("The new passwords don't match.")
+        self.conn.execute("UPDATE users SET password_hash = ? WHERE id = ?", (auth.hash_password(new), u["id"]))
+        self.conn.commit()
+        self.sign_in(self.get_user(u["id"]))
+
+    def list_templates(self):
+        return self.conn.execute("SELECT * FROM perm_templates ORDER BY name COLLATE NOCASE").fetchall()
+
+    @staticmethod
+    def template_perms(template) -> list[str]:
+        return [p for p in (template["perms"] or "").split(",") if p]
+
+    def save_template(self, name, perms) -> int:
+        """Admin only. Saving under an existing name replaces that template."""
+        self._need_admin()
+        name = " ".join((name or "").split())
+        if not name:
+            raise BookingError("Give the template a name.")
+        perms = ",".join(p for p in dict.fromkeys(perms or []) if p in auth.ALL_PERMISSIONS)
+        self.conn.execute("INSERT INTO perm_templates (name, perms) VALUES (?, ?) "
+                          "ON CONFLICT(name) DO UPDATE SET perms = excluded.perms", (name, perms))
+        self.conn.commit()
+        return self.conn.execute("SELECT id FROM perm_templates WHERE name = ?", (name,)).fetchone()["id"]
+
+    def delete_template(self, template_id) -> None:
+        self._need_admin()
+        self.conn.execute("DELETE FROM perm_templates WHERE id = ?", (template_id,))
+        self.conn.commit()
+
+    # ------------------------------------------------------------ reset (admin)
+    RESET_TABLES = ("items", "payments", "cards", "expenses", "customers", "stock_moves", "cash_drawer")
+
+    def reset_app_data(self, password, confirm) -> str | None:
+        """Admin only: wipe all activity (bookings, bills, payments, expenses, customers, stock movements and
+        cash drawer entries). Menu, rooms, prices, payment accounts, stock item names and users are kept and
+        stock quantities go to 0. A backup copy of the database is saved first; its path is returned."""
+        self._need_admin()
+        if self.user is None:
+            raise PermissionDenied("Sign in as the admin first.")
+        if (password or "") != (confirm or ""):
+            raise BookingError("The two passwords don't match.")
+        if not auth.check_password(password or "", self.get_user(self.user["id"])["password_hash"]):
+            raise BookingError("Wrong admin password.")
+        backup = self.backup()
+        for t in self.RESET_TABLES:
+            self.conn.execute(f"DELETE FROM {t}")
+        self.conn.execute("UPDATE stock_items SET quantity = 0")
+        self.conn.execute("DELETE FROM sqlite_sequence WHERE name IN (%s)" % ",".join("?" * len(self.RESET_TABLES)),
+                          self.RESET_TABLES)
+        self.conn.commit()
+        return backup
+
+    def backup(self) -> str | None:
+        """Copy the whole database to backups/upspace-YYYY-MM-DD-HHMMSS.db next to it (None for an in-memory db)."""
+        import os
+        if not self.path or self.path == ":memory:":
+            return None
+        folder = os.path.join(os.path.dirname(os.path.abspath(self.path)), "backups")
+        os.makedirs(folder, exist_ok=True)
+        dest = os.path.join(folder, f"upspace-{datetime.now():%Y-%m-%d-%H%M%S}.db")
+        target = sqlite3.connect(dest)
+        try:
+            self.conn.commit()
+            self.conn.backup(target)
+        finally:
+            target.close()
+        return dest
+
+    # ------------------------------------------------------------ cash drawer
+    def _check_cash_day(self, day: date) -> str:
+        self._need("money.cash")
+        if day != date.today() and not self.can("money.past_dates"):
+            raise PermissionDenied("You can only change today's cash.")
+        return day.isoformat()
+
+    @staticmethod
+    def _cash_amount(amount, allow_zero: bool) -> float:
+        try:
+            amount = round(float(str(amount if amount is not None else "").replace(",", "") or 0), 2)
+        except ValueError:
+            raise BookingError("The amount must be a number.")
+        if amount < 0 or (amount == 0 and not allow_zero):
+            raise BookingError("The amount must be more than 0." if not allow_zero else "The amount can't be negative.")
+        return amount
+
+    def set_opening_cash(self, day: date, amount) -> None:
+        """The cash in the drawer when the day started (0 unless set)."""
+        key = self._check_cash_day(day)
+        amount = self._cash_amount(amount, allow_zero=True)
+        self.conn.execute("DELETE FROM cash_drawer WHERE day = ? AND kind = 'opening'", (key,))
+        self.conn.execute("INSERT INTO cash_drawer (day, kind, amount, created_at, created_by) "
+                          "VALUES (?, 'opening', ?, ?, ?)", (key, amount, now_str(), self.user_id()))
+        self.conn.commit()
+
+    def add_cash(self, day: date, amount, note: str = "") -> int:
+        """Extra cash put in the drawer during the day (not income)."""
+        key = self._check_cash_day(day)
+        amount = self._cash_amount(amount, allow_zero=False)
+        cur = self.conn.execute("INSERT INTO cash_drawer (day, kind, amount, note, created_at, created_by) "
+                                "VALUES (?, 'add', ?, ?, ?, ?)",
+                                (key, amount, (note or "").strip() or None, now_str(), self.user_id()))
+        self.conn.commit()
+        return cur.lastrowid
+
+    def update_cash(self, entry_id: int, amount, note: str = "") -> None:
+        row = self.conn.execute("SELECT * FROM cash_drawer WHERE id = ?", (entry_id,)).fetchone()
+        if row is None:
+            return
+        self._check_cash_day(date.fromisoformat(row["day"]))
+        amount = self._cash_amount(amount, allow_zero=False)
+        self.conn.execute("UPDATE cash_drawer SET amount = ?, note = ? WHERE id = ?",
+                          (amount, (note or "").strip() or None, entry_id))
+        self.conn.commit()
+
+    def delete_cash(self, entry_id: int) -> None:
+        row = self.conn.execute("SELECT * FROM cash_drawer WHERE id = ?", (entry_id,)).fetchone()
+        if row is None:
+            return
+        self._check_cash_day(date.fromisoformat(row["day"]))
+        self.conn.execute("DELETE FROM cash_drawer WHERE id = ?", (entry_id,))
+        self.conn.commit()
+
+    def cash_drawer(self, day: date, accounts=None) -> dict:
+        """Opening cash, cash added, cash taken at checkout and cash paid for expenses on a day, and what
+        should be in the drawer: opening + added + cash in − cash out. None of the drawer entries is income."""
+        key = day.isoformat()
+        rows = self.conn.execute("SELECT * FROM cash_drawer WHERE day = ? ORDER BY id", (key,)).fetchall()
+        opening = next((r["amount"] for r in rows if r["kind"] == "opening"), 0.0)
+        added = [r for r in rows if r["kind"] == "add"]
+        accounts = accounts if accounts is not None else self.account_totals(day, day)
+        cash_in = round(sum(a["in"] for a in accounts if a["method"] == "cash"), 2)
+        cash_out = round(sum(a["out"] for a in accounts if a["method"] == "cash"), 2)
+        added_total = round(sum(r["amount"] for r in added), 2)
+        return {"opening": round(opening, 2), "added": added, "added_total": added_total,
+                "cash_in": cash_in, "cash_out": cash_out,
+                "drawer": round(opening + added_total + cash_in - cash_out, 2)}
 
     # --------------------------------------------------------------- settings
     def get_setting(self, key: str, default: str | None = None) -> str | None:
@@ -321,6 +645,7 @@ class Database:
 
     def set_hall_settings(self, chairs, tiers) -> None:
         """Chairs in the hall and the per-chair price for hours 1-4. New prices apply to new hall cards."""
+        self._need("settings.hall")
         try:
             chairs = int(str(chairs).strip())
         except (TypeError, ValueError):
@@ -369,6 +694,7 @@ class Database:
         return number
 
     def add_account(self, method: str, number: str) -> int:
+        self._need("settings.accounts")
         number = self._check_account(method, number)
         pos = self.conn.execute("SELECT COALESCE(MAX(position), 0) + 1 FROM payment_accounts").fetchone()[0]
         cur = self.conn.execute("INSERT INTO payment_accounts (method, number, position) VALUES (?, ?, ?)",
@@ -377,6 +703,7 @@ class Database:
         return cur.lastrowid
 
     def update_account(self, account_id: int, method: str, number: str) -> None:
+        self._need("settings.accounts")
         acc = self.get_account(account_id)
         if acc is None or acc["method"] == "cash":
             raise BookingError("Cash can't be edited.")
@@ -385,6 +712,7 @@ class Database:
         self.conn.commit()
 
     def remove_account(self, account_id: int) -> None:
+        self._need("settings.accounts")
         acc = self.get_account(account_id)
         if acc is None or acc["method"] == "cash":
             raise BookingError("Cash can't be removed.")
@@ -552,6 +880,8 @@ class Database:
 
     def add_menu_item(self, name, category, price=None, sizes: dict | None = None) -> int:
         """sizes=None → one price. sizes={"S": 30, "M": 40} → sold in those sizes."""
+        if not self.can_any("menu.edit", "inventory.edit"):
+            self._need("menu.edit")
         values = self._check_menu_input(name, category, price, sizes)
         pos = self.conn.execute("SELECT COALESCE(MAX(position), 0) + 1 FROM menu_items").fetchone()[0]
         cur = self.conn.execute("INSERT INTO menu_items (name, category, price, price_s, price_m, price_l, position) "
@@ -560,6 +890,8 @@ class Database:
         return cur.lastrowid
 
     def update_menu_item(self, item_id: int, name, category, price=None, sizes: dict | None = None) -> None:
+        if not self.can_any("menu.edit", "inventory.edit"):
+            self._need("menu.edit")
         values = self._check_menu_input(name, category, price, sizes, exclude_id=item_id)
         self.conn.execute("UPDATE menu_items SET name = ?, category = ?, price = ?, price_s = ?, price_m = ?, "
                           "price_l = ? WHERE id = ?", (*values, item_id))
@@ -567,6 +899,8 @@ class Database:
 
     def set_menu_stock(self, item_id: int, stock_item_id, per_sale=1) -> None:
         """Link a menu item to an inventory item (None = not tracked, e.g. drinks made fresh)."""
+        if not self.can_any("menu.edit", "inventory.edit"):
+            self._need("menu.edit")
         if stock_item_id is not None:
             st = self.get_stock_item(stock_item_id)
             if st is None or not st["active"]:
@@ -584,6 +918,7 @@ class Database:
         self.conn.commit()
 
     def remove_menu_item(self, item_id: int) -> None:
+        self._need("menu.edit")
         # Soft delete: bills already made keep the item's name and price.
         self.conn.execute("UPDATE menu_items SET active = 0 WHERE id = ?", (item_id,))
         self.conn.commit()
@@ -617,6 +952,7 @@ class Database:
         return row is not None
 
     def add_room(self, name: str, price) -> int:
+        self._need("settings.rooms")
         name, price = self._check_room_input(name, price)
         if self._name_taken(name):
             raise BookingError(f'A room called "{name}" already exists.')
@@ -625,6 +961,7 @@ class Database:
         return cur.lastrowid
 
     def update_room(self, room_id: int, name: str, price) -> None:
+        self._need("settings.rooms")
         name, price = self._check_room_input(name, price)
         if self._name_taken(name, room_id):
             raise BookingError(f'A room called "{name}" already exists.')
@@ -632,6 +969,7 @@ class Database:
         self.conn.commit()
 
     def remove_room(self, room_id: int) -> None:
+        self._need("settings.rooms")
         if room_id in self.busy_room_ids():
             raise BookingError("This room is in use. Check the customer out first.")
         # Soft delete keeps old bills intact.
@@ -683,6 +1021,7 @@ class Database:
         self.conn.execute("UPDATE cards SET customer_id = ? WHERE id = ?", (cid, card_id))
 
     def open_room_card(self, customer: str, phone: str, room_id: int, when: datetime | None = None) -> int:
+        self._need("rooms.open")
         cust, customer, phone = self._booking_customer(customer, phone, when)
         room = self.conn.execute("SELECT * FROM rooms WHERE id = ? AND active = 1", (room_id,)).fetchone()
         if room is None:
@@ -690,14 +1029,15 @@ class Database:
         if room_id in self.busy_room_ids():
             raise BookingError(f'"{room["name"]}" is already reserved right now.')
         cur = self.conn.execute(
-            "INSERT INTO cards (kind, customer_name, phone, room_id, room_name, rate, start_time) "
-            "VALUES ('room', ?, ?, ?, ?, ?, ?)",
-            (customer, phone, room_id, room["name"], room["price_per_hour"], now_str(when)))
+            "INSERT INTO cards (kind, customer_name, phone, room_id, room_name, rate, start_time, opened_by) "
+            "VALUES ('room', ?, ?, ?, ?, ?, ?, ?)",
+            (customer, phone, room_id, room["name"], room["price_per_hour"], now_str(when), self.user_id()))
         self._link_customer(cur.lastrowid, cust, customer, phone, now_str(when))
         self.conn.commit()
         return cur.lastrowid
 
     def open_hall_card(self, customer: str, phone: str, chairs, when: datetime | None = None) -> int:
+        self._need("hall.open")
         cust, customer, phone = self._booking_customer(customer, phone, when)
         try:
             chairs = int(chairs)
@@ -709,9 +1049,9 @@ class Database:
         if chairs > free:
             raise BookingError(f"Only {free} chair(s) are free in the hall.")
         cur = self.conn.execute(
-            "INSERT INTO cards (kind, customer_name, phone, chairs, hall_tiers, start_time) "
-            "VALUES ('hall', ?, ?, ?, ?, ?)",
-            (customer, phone, chairs, pricing.tiers_to_text(self.hall_tiers()), now_str(when)))
+            "INSERT INTO cards (kind, customer_name, phone, chairs, hall_tiers, start_time, opened_by) "
+            "VALUES ('hall', ?, ?, ?, ?, ?, ?)",
+            (customer, phone, chairs, pricing.tiers_to_text(self.hall_tiers()), now_str(when), self.user_id()))
         self._link_customer(cur.lastrowid, cust, customer, phone, now_str(when))
         self.conn.commit()
         return cur.lastrowid
@@ -732,6 +1072,7 @@ class Database:
             raise BookingError("This card is not open.")
         if card["kind"] != "room":
             raise BookingError("Discounts are for rooms only.")
+        self._need("rooms.discount")
         try:
             value = float(value or 0)
         except (TypeError, ValueError):
@@ -750,6 +1091,7 @@ class Database:
         card = self.get_card(card_id)
         if card is None or card["status"] != "open":
             return
+        self._need(card_perm(card["kind"], "cancel"))
         for it in self.card_items(card_id):
             self._return_stock(it, card_id)
         self.conn.execute("UPDATE cards SET status = 'cancelled', end_time = ? WHERE id = ? AND status = 'open'",
@@ -770,6 +1112,7 @@ class Database:
         card = self.get_card(card_id)
         if card is None or card["status"] != "open":
             raise BookingError("This card is not open.")
+        self._need(card_perm(card["kind"], "items"))
         rows, need, names = [], {}, {}
         for menu_item_id, size, qty in lines:
             try:
@@ -827,8 +1170,58 @@ class Database:
         row = self.conn.execute("SELECT * FROM items WHERE id = ?", (item_id,)).fetchone()
         if row is None:
             return
+        card = self.get_card(row["card_id"])
+        if card is None or card["status"] != "open":
+            raise BookingError("This card is not open, so its items can't change.")
+        self._need(card_perm(card["kind"], "items"))
         self._return_stock(row, row["card_id"])
         self.conn.execute("DELETE FROM items WHERE id = ?", (item_id,))
+        self.conn.commit()
+
+    def set_item_quantities(self, card_id: int, changes: dict) -> None:
+        """Edit items already on an open card: {item_id: new quantity}. 0 removes the line. Lowering a
+        quantity gives the stock back; raising it takes more (checked first, all or nothing)."""
+        card = self.get_card(card_id)
+        if card is None or card["status"] != "open":
+            raise BookingError("This card is not open, so its items can't change.")
+        self._need(card_perm(card["kind"], "items"))
+        plan, need = [], {}
+        for item_id, qty in changes.items():
+            row = self.conn.execute("SELECT * FROM items WHERE id = ? AND card_id = ?", (item_id, card_id)).fetchone()
+            if row is None:
+                continue
+            try:
+                qty = int(qty)
+            except (TypeError, ValueError):
+                raise BookingError("Quantity must be a whole number.")
+            if qty < 0:
+                raise BookingError("Quantity can't be negative.")
+            old = int(row["qty"] or 1)
+            if qty == old:
+                continue
+            per_unit_stock = (row["stock_qty"] or 0) / old if row["stock_item_id"] is not None else 0
+            delta_stock = per_unit_stock * (qty - old)
+            if row["stock_item_id"] is not None and delta_stock > 0:
+                need[row["stock_item_id"]] = need.get(row["stock_item_id"], 0) + delta_stock
+            plan.append((row, old, qty, per_unit_stock, delta_stock))
+        for stock_id, amount in need.items():
+            st = self.get_stock_item(stock_id)
+            if st is not None and st["quantity"] + 1e-9 < amount:
+                name = next(r["name"] for r, *_ in plan if r["stock_item_id"] == stock_id)
+                raise OutOfStock(st, amount, name)
+        for row, old, qty, per_unit_stock, delta_stock in plan:
+            label_ = item_label(row)
+            if row["stock_item_id"] is not None and delta_stock and self.get_stock_item(row["stock_item_id"]):
+                self._move(row["stock_item_id"], -delta_stock, "sale" if delta_stock > 0 else "return",
+                           f"{label_} → {qty}", card_id=card_id)
+            if qty == 0:
+                self.conn.execute("DELETE FROM items WHERE id = ?", (row["id"],))
+            else:
+                unit = row["unit_price"] if row["unit_price"] is not None else row["price"] / old
+                self.conn.execute("UPDATE items SET qty = ?, price = ?, stock_qty = ? WHERE id = ?",
+                                  (qty, round(unit * qty, 2),
+                                   per_unit_stock * qty if row["stock_item_id"] is not None else row["stock_qty"],
+                                   row["id"]))
         self.conn.commit()
 
     def card_items(self, card_id: int):
@@ -863,14 +1256,16 @@ class Database:
         card = self.get_card(card_id)
         if card is None or card["status"] != "open":
             raise BookingError("This card is not open.")
+        self._need(card_perm(card["kind"], "checkout"))
         end = end or datetime.now()
         bill = self.compute_bill(card, end)
         checked = self._check_payments(payments, bill.total, "bill")
         self._save_payments("card", card_id, checked, now_str(end))
         self.conn.execute(
             "UPDATE cards SET status = 'closed', end_time = ?, minutes = ?, billed_hours = ?, "
-            "time_cost = ?, items_total = ?, total = ? WHERE id = ?",
-            (now_str(end), bill.minutes, bill.billed_hours, bill.time_cost, bill.items_total, bill.total, card_id))
+            "time_cost = ?, items_total = ?, total = ?, closed_by = ? WHERE id = ?",
+            (now_str(end), bill.minutes, bill.billed_hours, bill.time_cost, bill.items_total, bill.total,
+             self.user_id(), card_id))
         self.conn.commit()
         return bill
 
@@ -890,16 +1285,18 @@ class Database:
 
     def add_expense(self, description: str, amount, when: datetime | None = None, payments=None) -> int:
         """payments: which account(s) the money came from, same rules as a bill. Required."""
+        self._need("money.add_expense")
         description, amount = self._check_expense(description, amount)
         checked = self._check_payments(payments, amount, "expense")
         ts = now_str(when)
-        cur = self.conn.execute("INSERT INTO expenses (description, amount, created_at) VALUES (?, ?, ?)",
-                                (description, amount, ts))
+        cur = self.conn.execute("INSERT INTO expenses (description, amount, created_at, created_by) "
+                                "VALUES (?, ?, ?, ?)", (description, amount, ts, self.user_id()))
         self._save_payments("expense", cur.lastrowid, checked, ts)
         self.conn.commit()
         return cur.lastrowid
 
     def update_expense(self, expense_id: int, description: str, amount, payments=None) -> None:
+        self._need("money.edit_expense")
         description, amount = self._check_expense(description, amount)
         checked = self._check_payments(payments, amount, "expense")
         row = self.conn.execute("SELECT created_at FROM expenses WHERE id = ?", (expense_id,)).fetchone()
@@ -909,6 +1306,7 @@ class Database:
         self.conn.commit()
 
     def delete_expense(self, expense_id: int) -> None:
+        self._need("money.edit_expense")
         self.conn.execute("DELETE FROM payments WHERE kind = 'expense' AND ref_id = ?", (expense_id,))
         self.conn.execute("DELETE FROM expenses WHERE id = ?", (expense_id,))
         self.conn.commit()
@@ -1012,6 +1410,7 @@ class Database:
         return name, phone
 
     def add_customer(self, name, phone, notes: str = "") -> int:
+        self._need("customers.edit")
         name, phone = self._check_customer_input(name, phone)
         cur = self.conn.execute("INSERT INTO customers (phone, name, notes, created_at) VALUES (?, ?, ?, ?)",
                                 (phone, name, (notes or "").strip() or None, now_str()))
@@ -1020,6 +1419,7 @@ class Database:
 
     def update_customer(self, customer_id: int, name, phone, notes: str = "") -> None:
         """Change a customer's name/phone (only from the Customers tab). Their open cards show the new name."""
+        self._need("customers.edit")
         name, phone = self._check_customer_input(name, phone, exclude_id=customer_id)
         self.conn.execute("UPDATE customers SET name = ?, phone = ?, notes = ? WHERE id = ?",
                           (name, phone, (notes or "").strip() or None, customer_id))
@@ -1028,13 +1428,40 @@ class Database:
         self.conn.commit()
 
     def remove_customer(self, customer_id: int) -> None:
-        n = self.conn.execute("SELECT COUNT(*) FROM cards WHERE customer_id = ? AND status != 'cancelled'",
+        """Delete the customer record. Their past bills stay exactly as they were (each bill keeps its own copy
+        of the name, phone and amounts), so money totals and statistics don't change. Not allowed while the
+        customer has an open card."""
+        self._need("customers.delete")
+        n = self.conn.execute("SELECT COUNT(*) FROM cards WHERE customer_id = ? AND status = 'open'",
                               (customer_id,)).fetchone()[0]
         if n:
-            raise BookingError("This customer has bookings, so they're kept for the statistics.")
-        self.conn.execute("UPDATE cards SET customer_id = NULL WHERE customer_id = ?", (customer_id,))
+            raise BookingError("This customer has an open card right now. Check it out or cancel it first.")
+        self.conn.execute("UPDATE cards SET customer_id = NULL, customer_removed = 1 WHERE customer_id = ?",
+                          (customer_id,))
         self.conn.execute("DELETE FROM customers WHERE id = ?", (customer_id,))
         self.conn.commit()
+
+    def search_customers(self, text: str, limit: int = 8):
+        """Suggestions while typing on a new card: customers whose name contains the text, or whose phone
+        contains its digits. Needs 2 or more letters / digits."""
+        text = (text or "").strip()
+        digits = re.sub(r"\D", "", text)
+        if len(text) < 2:
+            return []
+        if len(digits) >= 2 and len(digits) >= len(text.replace(" ", "")) - 1:     # typing a phone
+            sql, args = "phone LIKE ?", [f"%{digits}%"]
+        else:
+            sql, args = "name LIKE ?", [f"%{text}%"]
+        return self.conn.execute(
+            f"SELECT cu.*, (SELECT MAX(end_time) FROM cards c WHERE c.customer_id = cu.id) AS last_visit "
+            f"FROM customers cu WHERE {sql} ORDER BY last_visit IS NULL, last_visit DESC, name COLLATE NOCASE "
+            f"LIMIT {int(limit)}", args).fetchall()
+
+    def removed_customer_stats(self) -> dict:
+        """Visits and money from customers that were deleted (still part of every total)."""
+        row = self.conn.execute("SELECT COUNT(*) AS visits, COALESCE(SUM(total), 0) AS spent FROM cards "
+                                "WHERE customer_removed = 1 AND status = 'closed'").fetchone()
+        return {"visits": row["visits"], "spent": round(row["spent"], 2)}
 
     def list_customers(self, search: str = ""):
         """Every customer with their lifetime numbers (closed bills only), most recent visit first."""
@@ -1049,7 +1476,7 @@ class Database:
             (q, digits, f"%{digits}%")).fetchall()
 
     def _cust_where(self, customer_id, start, end):
-        sql, args = "c.status = 'closed' AND c.customer_id IS NOT NULL", []
+        sql, args = "c.status = 'closed' AND (c.customer_id IS NOT NULL OR c.customer_removed = 1)", []
         if customer_id is not None:
             sql += " AND c.customer_id = ?"
             args.append(customer_id)
@@ -1087,7 +1514,7 @@ class Database:
             "first_visit": min((c["start_time"] for c in cards), default=None),
             "last_visit": max((c["end_time"] for c in cards), default=None),
             "items": items,
-            "customers": len({c["customer_id"] for c in cards}),
+            "customers": len({c["customer_id"] for c in cards if c["customer_id"] is not None}),
         }
 
     def top_customers(self, start: date | None = None, end: date | None = None, limit: int | None = None):
@@ -1102,6 +1529,21 @@ class Database:
         if limit:
             sql += f" LIMIT {int(limit)}"
         return self.conn.execute(sql, args + args).fetchall()
+
+    def removed_customers_total(self, start: date | None = None, end: date | None = None):
+        """One row for every deleted customer together, ranked like top_customers (None if there are none)."""
+        where, args = self._cust_where(None, start, end)
+        r = self.conn.execute(
+            "SELECT COUNT(c.id) AS visits, SUM(c.minutes) AS minutes, SUM(c.items_total) AS items_spent, "
+            "SUM(c.total) AS total, MAX(c.end_time) AS last_visit, "
+            "(SELECT COALESCE(SUM(COALESCE(i.qty, 1)), 0) FROM items i JOIN cards c2 ON c2.id = i.card_id "
+            f" WHERE c2.customer_removed = 1 AND {where.replace('c.', 'c2.')}) AS items_count "
+            f"FROM cards c WHERE c.customer_removed = 1 AND {where}", args + args).fetchone()
+        if not r["visits"]:
+            return None
+        return {"id": None, "name": "Deleted customers", "phone": "", "visits": r["visits"], "minutes": r["minutes"],
+                "items_spent": r["items_spent"], "total": r["total"], "last_visit": r["last_visit"],
+                "items_count": r["items_count"]}
 
     def card_items_text(self, card_id: int) -> str:
         return ", ".join(item_label(i) for i in self.card_items(card_id))
@@ -1141,6 +1583,7 @@ class Database:
         return name, unit, low
 
     def add_stock_item(self, name, unit="pcs", quantity=0, low_level=5) -> int:
+        self._need("inventory.edit")
         name, unit, low = self._check_stock_input(name, unit, low_level)
         qty = self._qty(quantity, "Starting quantity", allow_zero=True)
         cur = self.conn.execute("INSERT INTO stock_items (name, unit, quantity, low_level, created_at) "
@@ -1151,6 +1594,7 @@ class Database:
         return cur.lastrowid
 
     def update_stock_item(self, stock_item_id: int, name, unit, low_level) -> None:
+        self._need("inventory.edit")
         name, unit, low = self._check_stock_input(name, unit, low_level, exclude_id=stock_item_id)
         self.conn.execute("UPDATE stock_items SET name = ?, unit = ?, low_level = ? WHERE id = ?",
                           (name, unit, low, stock_item_id))
@@ -1158,6 +1602,7 @@ class Database:
 
     def remove_stock_item(self, stock_item_id: int) -> None:
         """Soft delete; menu items linked to it stop being tracked."""
+        self._need("inventory.edit")
         self.conn.execute("UPDATE stock_items SET active = 0 WHERE id = ?", (stock_item_id,))
         self.conn.execute("UPDATE menu_items SET stock_item_id = NULL WHERE stock_item_id = ?", (stock_item_id,))
         self.conn.commit()
@@ -1175,24 +1620,27 @@ class Database:
 
     def restock(self, stock_item_id: int, quantity, note: str = "", cost=None, payments=None) -> None:
         """Add stock. With a cost, it's also recorded as an expense (payment required, like any expense)."""
+        self._need("inventory.restock")
         st = self.get_stock_item(stock_item_id)
         if st is None or not st["active"]:
             raise BookingError("That inventory item no longer exists.")
         qty = self._qty(quantity, "Quantity")
         expense_id = None
         if cost is not None and str(cost).strip() != "":
+            self._need("money.add_expense")
             desc = f"Restock: {fmt_qty(qty)} {st['unit']} {st['name']}" + (f" ({note.strip()})" if note.strip() else "")
             amount = self._qty(cost, "Cost")
             checked = self._check_payments(payments, amount, "expense")
             ts = now_str()
-            expense_id = self.conn.execute("INSERT INTO expenses (description, amount, created_at) VALUES (?, ?, ?)",
-                                           (desc, amount, ts)).lastrowid
+            expense_id = self.conn.execute("INSERT INTO expenses (description, amount, created_at, created_by) "
+                                           "VALUES (?, ?, ?, ?)", (desc, amount, ts, self.user_id())).lastrowid
             self._save_payments("expense", expense_id, checked, ts)
         self._move(stock_item_id, qty, "restock", note, expense_id=expense_id)
         self.conn.commit()
 
     def take_out(self, stock_item_id: int, quantity, note: str) -> None:
         """Remove stock that wasn't sold on a card (waste, broken, own use...). A reason is required."""
+        self._need("inventory.adjust")
         st = self.get_stock_item(stock_item_id)
         qty = self._qty(quantity, "Quantity")
         if not (note or "").strip():
@@ -1204,6 +1652,7 @@ class Database:
 
     def set_count(self, stock_item_id: int, counted, note: str = "") -> None:
         """Stock count: set the quantity to what was counted on the shelf; the difference is logged."""
+        self._need("inventory.adjust")
         st = self.get_stock_item(stock_item_id)
         counted = self._qty(counted, "Counted quantity", allow_zero=True)
         diff = round(counted - st["quantity"], 4)
@@ -1222,6 +1671,7 @@ class Database:
     def sell_stock_item(self, stock_item_id: int, price, category: str, name: str | None = None) -> int:
         """Put an inventory item on the menu (so it shows in "+ Items"), linked 1 unit per sale.
         A menu item with the same name is linked instead of creating a duplicate."""
+        self._need("inventory.edit")
         st = self.get_stock_item(stock_item_id)
         if st is None or not st["active"]:
             raise BookingError("That inventory item no longer exists.")
